@@ -1,0 +1,12 @@
+# Python 运行时产物
+__pycache__/
+*.py[cod]
+
+# 运行时数据（含真实令牌与内网地址，仅保留在本地，不入库）
+data/devices.json
+data/*.lock
+data/*.tmp*
+
+# 编辑器与工具产物
+.trae/
+.screenshots/
