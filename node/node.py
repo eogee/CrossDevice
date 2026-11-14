@@ -48,7 +48,8 @@ CrossDevice 执行器（node）
 
 能力扩展（S2，契约 §13–§17）：
     - 大文件流式：checksum / download（Range 206）/ 上传三段式，全程分块读写不整载
-    - 工作空间白名单：workspace 默认空 = 拒绝一切写/删/建目录/移动/上传（§14）
+    - 工作空间白名单：workspace 默认空 = 仅默认暂存目录可写，其余写/删/建目录/
+      移动/上传全拒（§14；B42 起暂存目录恒可用且报错/查询接口自带允许根列表）
     - 任务历史：sqlite 落库（tasks.db）、/v1/task/list 与详情、留存先到先清（§15）
     - 端口与多实例：默认 51888、占用 +1 顺延并持久化、--instance 实例隔离（§16）
 
@@ -112,7 +113,7 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-NODE_VERSION = "0.5.0"
+NODE_VERSION = "0.5.1"
 MAX_OUTPUT = 256 * 1024          # 单个任务输出上限
 MAX_BODY = 64 * 1024 * 1024      # 请求体上限
 DEFAULT_PORT = 51888             # S2 默认端口（D28/B20，偏差 7；契约 §16.1）
@@ -182,6 +183,9 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)   # ShellExecuteExW 提权（§22.1）
+# CommandLineToArgvW（B43）：Windows 官方 argv 切分语义，shell=none 依赖
+shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
 
 HANDLE = wintypes.HANDLE
 HDC = wintypes.HDC
@@ -552,6 +556,9 @@ def collect_info():
     vx, vy, vw, vh = virtual_screen()
     return {
         "node_version": NODE_VERSION,
+        # B42 新增（契约 §6.2 V1.6）：工作空间白名单可查询（含默认暂存目录）
+        "workspace_roots": list(WORKSPACE_ROOTS),
+        "workspace_staging": STAGING_ROOT or None,
         "hostname": socket.gethostname(),
         "user": os.environ.get("USERNAME", ""),
         "os": platform.platform(),
@@ -703,20 +710,62 @@ def _trim(text):
     return text[:MAX_OUTPUT] + "\n...[输出已截断]"
 
 
+def split_windows_argv(text):
+    """按 CommandLineToArgvW（Windows 官方 argv 语义）切分命令行（B43）。
+
+    引号内空格不拆散、\\" 为字面引号；与历史 prompt.split() 行为对齐：
+    先 strip()（CommandLineToArgvW 对前导空白会产出空首参），空串返回 []。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return []
+    n = ctypes.c_int(0)
+    lp = shell32.CommandLineToArgvW(stripped, ctypes.byref(n))
+    if not lp:
+        return []
+    try:
+        return list(lp[:n.value])
+    finally:
+        kernel32.LocalFree(lp)
+
+
 def build_argv(prompt, shell):
+    """构造非 cmd 形态的 argv（cmd 形态由 spawn_shell 走字符串路径，B43）。
+
+    - powershell：-EncodedCommand（base64 UTF-16LE）——PS 5.1 向原生 exe 传参
+      不转义内嵌双引号（PS 7.3 才修复），-Command 形态深层嵌套引号不可靠；
+      编码形态无引号歧义，任务历史仍存原始 cmd。
+    - none：CommandLineToArgvW 切分（B43 前 prompt.split() 按空格硬切，
+      会拆散带引号参数）。
+    """
     if shell == "powershell":
+        encoded = base64.b64encode(prompt.encode("utf-16-le")).decode("ascii")
         return ["powershell", "-NoProfile", "-NonInteractive",
-                "-ExecutionPolicy", "Bypass", "-Command", prompt]
+                "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded]
     if shell == "none":
-        return prompt if isinstance(prompt, list) else prompt.split()
-    return ["cmd", "/c", prompt]
+        return list(prompt) if isinstance(prompt, list) else split_windows_argv(prompt)
+    raise ValueError("build_argv 仅支持 powershell/none；cmd 形态走 spawn_shell")
+
+
+def spawn_shell(prompt, shell, cwd, **popen_kwargs):
+    """按 shell 形态拉起子进程（B43 引号逐字透传的唯一入口）。
+
+    cmd 形态：命令行以字符串 + shell=True 直达 COMSPEC /c——不经
+    list2cmdline 的 \\" 转义，cmd /c 的首尾引号剥除老规则不再吞掉内层引号
+    （B43 前 ["cmd", "/c", prompt] 列表形态导致 tasklist /FI "..."、
+    python -c "..." 等带引号命令全部失效）。powershell/none 走 build_argv
+    （前者已 base64 编码无引号歧义，后者已按 Windows 语义切分）。
+    """
+    if shell in ("powershell", "none"):
+        return subprocess.Popen(build_argv(prompt, shell), cwd=cwd, **popen_kwargs)
+    return subprocess.Popen(prompt, shell=True, cwd=cwd, **popen_kwargs)
 
 
 def start_detached(prompt, shell="cmd", cwd=None):
     """启动 GUI 程序用：不等待、不接管输出，否则子进程会占住管道让任务一直挂着。"""
     DETACHED_PROCESS = 0x00000008
-    proc = subprocess.Popen(
-        build_argv(prompt, shell), cwd=cwd,
+    proc = spawn_shell(
+        prompt, shell, cwd,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
         creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
@@ -725,11 +774,11 @@ def start_detached(prompt, shell="cmd", cwd=None):
 
 
 def _run_job(job_id, prompt, shell, cwd, timeout):
-    argv = build_argv(prompt, shell)
     started = time.time()
     try:
-        proc = subprocess.Popen(
-            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc = spawn_shell(
+            prompt, shell, cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
         )
         try:
@@ -1076,8 +1125,11 @@ def fs_stat(path):
 # 工作空间白名单（契约 §14）
 # --------------------------------------------------------------------------
 
-WORKSPACE_ROOTS = []                # 规范化后的白名单根列表（§14.1；默认空 = 拒绝一切写删）
-MAX_WORKSPACE_ROOTS = 16            # 白名单根数量上限（§14.1）
+WORKSPACE_ROOTS = []                # 判定用根列表：用户根 + 默认暂存目录（均规范化；§14.1/§14.3）
+USER_WORKSPACE_ROOTS = []           # 用户显式配置的根（不含暂存目录；空 = 仅默认暂存可用）
+STAGING_ROOT = ""                   # 默认暂存目录 <config 目录>/tmp（B42：自动化友好，恒可用，
+                                    # 不计入 16 上限；启动时自动创建）
+MAX_WORKSPACE_ROOTS = 16            # 用户白名单根数量上限（§14.1）
 
 
 def normalize_real(path):
@@ -1107,9 +1159,15 @@ def workspace_hit(path):
     return False, "root_missing", norm
 
 
-def load_workspace(args, cfg):
-    """加载白名单根（契约 §14.1）：CLI --workspace（逗号分隔）覆盖配置文件 workspace。"""
-    global WORKSPACE_ROOTS
+def load_workspace(args, cfg, config_file=None):
+    """加载白名单根（契约 §14.1）：CLI --workspace（逗号分隔）覆盖配置文件 workspace。
+
+    B42 起（V1.6）默认附加暂存目录 <config 目录>/tmp（--instance 时 tmp-<名>，
+    与任务库/审计同源隔离 §16.2）：自动化任务恒有可写暂存位置。定位是
+    「自动化友好」而非安全让步——exec 本为全能力通道，专用暂存目录不新增
+    攻击面。暂存目录不计入 16 上限；启动时自动创建；与用户根去重合并。
+    """
+    global WORKSPACE_ROOTS, USER_WORKSPACE_ROOTS, STAGING_ROOT
     if args.workspace is not None:
         raw = args.workspace.split(",")
     else:
@@ -1122,7 +1180,22 @@ def load_workspace(args, cfg):
         sys.stderr.write("[警告] 工作空间根数量超过上限 %d，仅保留前 %d 个\n"
                          % (MAX_WORKSPACE_ROOTS, MAX_WORKSPACE_ROOTS))
         roots = roots[:MAX_WORKSPACE_ROOTS]
-    WORKSPACE_ROOTS = [normalize_real(root) for root in roots]
+    USER_WORKSPACE_ROOTS = [normalize_real(root) for root in roots]
+    # 暂存目录：与配置文件同目录（node.json → tmp；node-<名>.json → tmp-<名>）
+    if config_file:
+        stem = os.path.splitext(os.path.basename(config_file))[0]
+        inst = stem[len("node-"):] if stem.startswith("node-") else ""
+        staging_raw = os.path.join(os.path.dirname(os.path.abspath(config_file)),
+                                   "tmp-" + inst if inst else "tmp")
+        try:
+            os.makedirs(staging_raw, exist_ok=True)
+        except OSError as exc:
+            sys.stderr.write("[警告] 暂存目录创建失败：%s（%s）\n" % (staging_raw, exc))
+        STAGING_ROOT = normalize_real(staging_raw)
+    merged = list(USER_WORKSPACE_ROOTS)
+    if STAGING_ROOT and STAGING_ROOT not in merged:
+        merged.append(STAGING_ROOT)
+    WORKSPACE_ROOTS = merged
 
 
 # --------------------------------------------------------------------------
@@ -2608,8 +2681,13 @@ class Handler(BaseHTTPRequestHandler):
     def ok(self, data):
         self.send_json({"ok": True, "data": data})
 
-    def fail(self, code, message, status=400):
-        self.send_json({"ok": False, "error": {"code": code, "message": message}}, status)
+    def fail(self, code, message, status=400, extra=None):
+        """错误响应（§1.3 包络）。extra：可选结构化附加字段（B42 起 SANDBOX_DENIED
+        附 allowed_roots/staging_root，供调用方机读；其余错误不传）。"""
+        err = {"code": code, "message": message}
+        if extra:
+            err.update(extra)
+        self.send_json({"ok": False, "error": err}, status)
 
     def read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -2629,14 +2707,29 @@ class Handler(BaseHTTPRequestHandler):
 
         SANDBOX_DENIED 属业务 403：审计 target 由调用方先行设置，照常落审计（§8.2）。
         约束范围：fs/write、fs/delete、fs/mkdir、fs/move（src+dst）、upload/begin。
+        B42 起（V1.6）拒绝响应自带指引：message 明示当前允许的根（仅剩默认
+        暂存时附配置入口），error 对象附 allowed_roots/staging_root 供机读。
         """
         ok, reason, _norm = workspace_hit(raw_path)
         if ok:
             return True
         if reason == "root_missing":
             self.fail("BAD_REQUEST", "工作空间根目录不存在：%s" % raw_path, 400)
+        elif USER_WORKSPACE_ROOTS:
+            self.fail("SANDBOX_DENIED",
+                      "路径超出工作空间白名单：%s；当前允许的根：%s"
+                      % (raw_path, "；".join(WORKSPACE_ROOTS)), 403,
+                      extra={"allowed_roots": list(WORKSPACE_ROOTS),
+                             "staging_root": STAGING_ROOT or None})
         else:
-            self.fail("SANDBOX_DENIED", "路径超出工作空间白名单：%s" % raw_path, 403)
+            self.fail("SANDBOX_DENIED",
+                      "路径超出工作空间白名单：%s；默认仅允许 node 暂存目录 %s；"
+                      "如需写入其他位置，请在被控端 node.json 配置 workspace 键"
+                      "或以 --workspace 启动参数添加允许根"
+                      "（被控端本地配置，控制端不可远程修改）"
+                      % (raw_path, STAGING_ROOT or "（未就绪）"), 403,
+                      extra={"allowed_roots": list(WORKSPACE_ROOTS),
+                             "staging_root": STAGING_ROOT or None})
         return False
 
     def _is_known_path(self, path):
@@ -3688,8 +3781,8 @@ def main():
                     audit_cfg.get("retention_days", 180))
     cleanup_audit_files()
 
-    # ---- 工作空间白名单（契约 §14.1）----
-    load_workspace(args, cfg)
+    # ---- 工作空间白名单（契约 §14.1；B42 起附默认暂存目录）----
+    load_workspace(args, cfg, config_file)
 
     # ---- 任务历史（契约 §15）：建库 → 恢复遗留 running → 启动清理 + 每小时后台清理 ----
     tasks_db_name = ("tasks-%s.db" % instance_name) if instance_name else "tasks.db"
@@ -3797,6 +3890,12 @@ def main():
     # S3 新增（契约 §7.1/§22.2）：高权限驻留标注；降级运行（未驻留）为正常状态，仅标注不告警
     print(" 驻留      : %s" % ("是（计划任务 %s）" % ELEVATED_TASK_NAME
                               if ELEVATED_TASK_NAME else "否"))
+    # B42 新增（契约 §14.1 V1.6）：白名单可见性——被控端所有者能一眼看到允许根与配置入口
+    if USER_WORKSPACE_ROOTS:
+        print(" 白名单    : %s" % "；".join(WORKSPACE_ROOTS))
+    else:
+        print(" 白名单    : 默认（仅暂存目录可写；node.json workspace 键可扩，D24）")
+    print(" 暂存目录  : %s" % (STAGING_ROOT or "未就绪"))
     print(line)
     if TLS_PLAINTEXT_DEBUG:
         print(" 警告：明文调试模式已开启（--debug-plaintext），传输不加密，")

@@ -310,7 +310,7 @@ def p2_confirm_ui(ctx, opts):
 
 def p3_confirm_sign(ctx, opts):
     """P3 confirm 签发：正确码 + name → 200 {token(32hex), identity, device_id(12hex),
-    cert_fingerprint(=证书实测指纹), node_version=0.5.0}；重复 confirm → 404 已消费。"""
+    cert_fingerprint(=证书实测指纹), node_version=0.5.1}；重复 confirm → 404 已消费。"""
     t0 = time.time() - 1
     ok_sign = False
     try:
@@ -325,7 +325,7 @@ def p3_confirm_sign(ctx, opts):
                    and isinstance(data.get("device_id"), str)
                    and bool(re.fullmatch(r"[0-9a-f]{12}", data.get("device_id") or ""))
                    and fp == ctx.fp1 and len(fp or "") == 64
-                   and data.get("node_version") == "0.5.0")
+                   and data.get("node_version") == "0.5.1")
         ev_sign = ("confirm → HTTP %s，token 32hex=%s，identity=%s，device_id 12hex=%s，"
                    "cert_fingerprint 与 TLS 证书实测一致=%s，node_version=%s"
                    % (status, bool(re.fullmatch(r"[0-9a-f]{32}", token or "")),
