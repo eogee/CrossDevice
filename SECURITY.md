@@ -18,9 +18,11 @@
 
 ## 2. 报告渠道
 
-**[占位：待维护者确认后替换为实际邮箱/.issue 链接]**
+**GitHub 私密安全报告（首选）**：[github.com/eogee/CrossDevice/security/advisories/new](https://github.com/eogee/CrossDevice/security/advisories/new) —— 仅报告者与维护者可见，适合未公开漏洞。
 
-在正式渠道落地前，请勿在公开 issue、讨论区或社交渠道披露细节。报告时请尽量包含：
+**仓库 Issues**：[github.com/eogee/CrossDevice/issues](https://github.com/eogee/CrossDevice/issues) —— 仅用于已公开问题与"已知边界"讨论；**未公开漏洞细节请勿直接发公开 issue**，请走上面的私密报告入口。
+
+请勿在讨论区或社交渠道披露细节。报告时请尽量包含：
 
 - 问题类型与影响面（哪一端、哪个接口/子命令）；
 - 复现步骤或最小复现脚本（脱敏，不含真实令牌与真实 IP）；
