@@ -108,9 +108,10 @@ def health_of(port):
 
 def s3_ready(health):
     """S3 就绪探测（仿 smoke_s2.s2_endpoints_ready 模式）：
-    /v1/health 含 rollback_flag 字段且 node_version 为 0.4.x → S3 端点已实现。"""
+    /v1/health 含 rollback_flag 字段且 node_version 为 0.4.x/0.5.x → S3 端点已实现
+    （0.5.x 为 M4/契约 V1.5 NODE_VERSION 升版既定适配，非断言放宽）。"""
     version = str(health.get("node_version") or "")
-    return bool(re.match(r"0\.4\.", version)) and "rollback_flag" in health
+    return bool(re.match(r"0\.[45]\.", version)) and "rollback_flag" in health
 
 
 def make_node_copy(tmp, tag):

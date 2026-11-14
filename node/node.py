@@ -31,6 +31,11 @@ CrossDevice 执行器（node）
     /v1/update/pin     追加可信 sha256 白名单（S3 新增，§20.2）
     /v1/elevate/install 高权限驻留计划任务安装引导（S3 新增，§22）
     /v1/elevate/remove 高权限驻留计划任务清理（S3 新增，§22）
+    /v1/pair/begin     发起设备一次确认配对（M4 新增，免鉴权 + 私网来源，§23）
+    /v1/pair/session   查询配对会话状态（M4 新增，免鉴权 + 仅回环，确认数据源，§23）
+    /v1/pair/approve   本地确认配对并生成一次性 6 位码（M4 新增，免鉴权 + 仅回环，§23）
+    /v1/pair/reject    本地拒绝配对（M4 新增，免鉴权 + 仅回环，§23）
+    /v1/pair/confirm   凭配对码签发身份令牌（M4 新增，免鉴权 + 私网来源，§23）
 
 安全基线（S1，唯一行为依据 docs/接口契约.md）：
     - 传输：默认 HTTPS（TLS 1.3，自签证书 + TOFU）；--debug-plaintext 才回退明文（D31）
@@ -60,6 +65,18 @@ CrossDevice 执行器（node）
     - 健康与展示：/v1/health 增 rollback_flag；横幅增 驻留 行；CLI 增
       --elevate-task-install / --elevate-task-remove 提权子命令
 
+设备一次确认配对（M4，契约 V1.5 §23，B34/D41/FR-15）：
+    - 端点族 /v1/pair/* 走 guard 变体（§2.3/§1.2 唯一例外）：免令牌免防重放头，
+      ① 私网来源校验照常；回环确认端点（session/approve/reject）另加仅 127.0.0.1/::1
+      检查（非回环 → 403，落审计）；其余既有端点的 guard 链零改动
+    - 会话状态机：idle → pending → approved → consumed；expired / voided 终态；
+      单活跃会话（内存结构重启清空），过期惰性判定（无后台线程）
+    - 防滥用三件套：一次性 6 位数字码（常量时间比较）+ 短时效（pending 120s /
+      code 300s，node.json pair 键可调）+ 猜码上限（默认 5 次失败作废会话）；
+      begin 来源限频（默认 10 秒，含被 429 拒绝的请求）
+    - confirm 签发 32 hex 新令牌入 node.json tokens（name 冲突自动后缀、上限 16）；
+      配对码与令牌永不落审计；广播不自动信任（D38）与 xd add 手工路径不变
+
 启动方式：
     python node.py [--port 51888] [--host 0.0.0.0] [--token <令牌>] [--verbose]
                    [--config <node.json 路径>] [--cert <cert.pem> --key <key.pem>]
@@ -77,6 +94,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -94,7 +112,7 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-NODE_VERSION = "0.4.0"
+NODE_VERSION = "0.5.0"
 MAX_OUTPUT = 256 * 1024          # 单个任务输出上限
 MAX_BODY = 64 * 1024 * 1024      # 请求体上限
 DEFAULT_PORT = 51888             # S2 默认端口（D28/B20，偏差 7；契约 §16.1）
@@ -138,6 +156,20 @@ BROADCAST_PORT = 51889              # UDP 发现广播端口（仅发送，不�
 BROADCAST_INTERVAL = 10             # 心跳间隔秒（D25：启动即发 1 帧 + 每 10 秒 1 帧）
 BROADCAST_MAX_BYTES = 512           # 报文上限字节（§19.1：超限跳过不截断）
 BROADCAST_CAPS = ["exec", "screen", "input", "fs", "update", "elevate"]   # §19.1 能力表
+
+# ---- M4 配对层全局状态（契约 V1.5 §23，B34/D41/FR-15）----
+PAIR_PENDING_TTL = 120              # pending 未确认最长等待秒（§23.2，下限 5、非法回退默认）
+PAIR_CODE_TTL = 300                 # approved 后配对码时效秒（§23.2，≤5 分钟，下限 5）
+PAIR_MAX_ATTEMPTS = 5               # confirm 猜码失败上限（§23.2，1–10）
+PAIR_BEGIN_INTERVAL = 10            # 同一来源 IP 两次 begin 最小间隔秒（0 = 关闭限频）
+PAIR_SESSION = None                 # 当前配对会话（单活跃；None = idle；重启清空，§23.2）
+PAIR_LOCK = threading.Lock()        # 会话状态机与限频表共用一把锁
+PAIR_BEGIN_TS = {}                  # {来源 IP: 上次 begin 时刻}（含被 429 拒绝的，§23.3）
+PAIR_ACTIVE_STATES = ("pending", "approved")     # 活跃态（终态保留待下次 begin 覆盖）
+PAIR_LOOPBACK = ("127.0.0.1", "::1")             # 回环确认端点允许的客户端（§23.1）
+PAIR_LOOPBACK_PATHS = frozenset({                # 仅回环的端点（§23.1）
+    "/v1/pair/session", "/v1/pair/approve", "/v1/pair/reject",
+})
 
 if os.name != "nt":
     raise SystemExit("node.py 仅支持 Windows（当前系统：%s）" % os.name)
@@ -1644,17 +1676,32 @@ def persist_config(mutator):
     atomic_write_json(CONFIG_FILE, cfg)
 
 
+def _pick_pair_param(section, key, default, low, high=None):
+    """pair 参数读取（契约 §9.1/§23.2 边界值表）：无法解析为整数 → 回退默认；
+    越界 → 钳到边界（同 input.lease_seconds 既有口径）。"""
+    try:
+        value = int(section.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    if high is None:
+        return max(low, value)
+    return min(high, max(low, value))
+
+
 def ensure_s3_config(cfg, config_file):
-    """node.json S3 新键初始化（契约 §9.1/§19.1/§20.1/§21.1/§22）：
+    """node.json S3/M4 新键初始化（契约 §9.1/§19.1/§20.1/§21.1/§22/§23.2）：
     - device_id：缺失或非法 → uuid4().hex[:12] 生成并原子写回（§19.1）；
     - update.hmac_key：缺失或非法 → os.urandom(32).hex() 生成并原子写回（§20.1）；
       trusted_hashes 缺省 []；
     - input.lease_seconds：下限 5、缺省 60、非法回退默认（§21.1）；
-    - elevated：缺省视为未驻留（§22）。
-    仅在发生变更时写盘；输入/驻留键仅读入内存，不主动写盘（缺省兼容）。
+    - elevated：缺省视为未驻留（§22）；
+    - pair 四参数：pending_ttl/code_ttl 下限 5、max_attempts 1–10、begin_interval ≥0
+      （0 = 关闭限频），非法回退默认（§23.2，V1.5 新增）。
+    仅在发生变更时写盘；输入/驻留/配对键仅读入内存，不主动写盘（缺省兼容）。
     """
     global DEVICE_ID, UPDATE_HMAC_KEY, TRUSTED_HASHES, INPUT_LEASE_SECONDS
     global ELEVATED_TASK_NAME
+    global PAIR_PENDING_TTL, PAIR_CODE_TTL, PAIR_MAX_ATTEMPTS, PAIR_BEGIN_INTERVAL
     changed = False
 
     device_id = cfg.get("device_id")
@@ -1700,6 +1747,13 @@ def ensure_s3_config(cfg, config_file):
         ELEVATED_TASK_NAME = elevated["task_name"]
     else:
         ELEVATED_TASK_NAME = None
+
+    # ---- M4 配对参数（契约 §9.1/§23.2）：缺省即默认；非法回退默认；越界钳到边界 ----
+    pair_cfg = cfg.get("pair") if isinstance(cfg.get("pair"), dict) else {}
+    PAIR_PENDING_TTL = _pick_pair_param(pair_cfg, "pending_ttl", 120, 5)
+    PAIR_CODE_TTL = _pick_pair_param(pair_cfg, "code_ttl", 300, 5)
+    PAIR_MAX_ATTEMPTS = _pick_pair_param(pair_cfg, "max_attempts", 5, 1, 10)
+    PAIR_BEGIN_INTERVAL = _pick_pair_param(pair_cfg, "begin_interval", 10, 0)
 
     if changed:
         try:
@@ -2309,6 +2363,186 @@ def schtasks_query(task_name):
 
 
 # --------------------------------------------------------------------------
+# 设备一次确认配对（契约 V1.5 §23，B34/D41/FR-15）
+# --------------------------------------------------------------------------
+
+def is_loopback(ip):
+    """回环判定（契约 §23.1：仅 127.0.0.1/::1，127.0.0.0/8 其余地址不算）。
+    独立 helper，便于冒烟白盒验证（对照 is_private 的函数级口径）。"""
+    return ip in PAIR_LOOPBACK
+
+
+def _pair_lazy_expire_locked():
+    """会话过期惰性判定（§23.2，需持锁，无后台线程）：
+    pending/approved 超 expires_at（pending 为创建+pending_ttl、approved 为
+    确认+code_ttl）即转 expired；终态保留在表内供错误回报，下次 begin 覆盖。"""
+    sess = PAIR_SESSION
+    if sess is not None and sess["state"] in PAIR_ACTIVE_STATES \
+            and time.time() > sess["expires_at"]:
+        sess["state"] = "expired"
+
+
+def pair_begin(client):
+    """POST /v1/pair/begin 业务逻辑（契约 §23.3）：来源限频（含被 429 拒绝的刷新）
+    → 单活跃会话检查（活跃不重置不替换）→ 创建 pending 会话（终态旧会话覆盖）。
+
+    返回 (data, err, status)：成功 (data, None, 200)；失败 (None, (code, message), status)。
+    """
+    global PAIR_SESSION
+    now = time.time()
+    with PAIR_LOCK:
+        # ① 来源限频：距上次 begin 不足 begin_interval → 429；
+        #    本次 begin（无论成败，含被 429 拒绝的）刷新 last_begin_ts
+        last = PAIR_BEGIN_TS.get(client)
+        PAIR_BEGIN_TS[client] = now
+        if PAIR_BEGIN_INTERVAL > 0 and last is not None \
+                and now - last < PAIR_BEGIN_INTERVAL:
+            wait = max(1, int(round(PAIR_BEGIN_INTERVAL - (now - last))))
+            return None, ("PAIR_RATE_LIMITED",
+                          "配对请求过于频繁，请约 %d 秒后重试" % wait), 429
+        # ② 惰性过期 + 单活跃会话检查：活跃（pending/approved）→ 409 不重置不替换
+        _pair_lazy_expire_locked()
+        if PAIR_SESSION is not None and PAIR_SESSION["state"] in PAIR_ACTIVE_STATES:
+            return None, ("PAIR_SESSION_ACTIVE",
+                          "已存在活跃配对会话（expires_at=%d），请由被控端确认、"
+                          "拒绝或等其过期后再试" % int(PAIR_SESSION["expires_at"])), 409
+        # ③ 创建 pending 会话（有终态旧会话则覆盖替换）
+        session_id = uuid.uuid4().hex[:16]
+        PAIR_SESSION = {
+            "session_id": session_id,
+            "state": "pending",
+            "source_ip": client,
+            "created_at": now,
+            "expires_at": now + PAIR_PENDING_TTL,
+            "code": None,               # approved 后生成 6 位数字码（§23.2）
+            "attempts": 0,              # confirm 猜码失败计数
+        }
+        return {"session_id": session_id, "state": "pending",
+                "expires_at": PAIR_SESSION["expires_at"]}, None, 200
+
+
+def pair_session_snapshot():
+    """GET /v1/pair/session 业务逻辑（契约 §23.3）：无会话 → {"state": "idle"}；
+    有会话 → 全字段 + approved 专属 code/code_expires_at/attempts_left。"""
+    with PAIR_LOCK:
+        _pair_lazy_expire_locked()
+        sess = PAIR_SESSION
+        if sess is None:
+            return {"state": "idle"}
+        data = {
+            "session_id": sess["session_id"],
+            "state": sess["state"],
+            "source_ip": sess["source_ip"],
+            "created_at": sess["created_at"],
+            "expires_at": sess["expires_at"],
+        }
+        if sess["state"] == "approved":
+            data["code"] = sess["code"]
+            data["code_expires_at"] = sess["expires_at"]
+            data["attempts_left"] = max(0, PAIR_MAX_ATTEMPTS - sess["attempts"])
+        return data
+
+
+def pair_approve():
+    """POST /v1/pair/approve 业务逻辑（契约 §23.3）：pending → approved 生成 6 位码；
+    幂等（已 approved 未过期 → 同一码与时效）；无活跃会话/已过期 → (None, err, 404)。
+
+    返回 (data, err, status)；err 为 (code, message)。approve 不消耗尝试次数。
+    """
+    with PAIR_LOCK:
+        _pair_lazy_expire_locked()
+        sess = PAIR_SESSION
+        if sess is None or sess["state"] not in PAIR_ACTIVE_STATES:
+            return None, ("PAIR_NO_SESSION", "无待确认的配对会话"), 404
+        if sess["state"] == "approved":
+            # 幂等：确认窗重开/进程重启后重读场景 → 返回同一 code 与 expires_at
+            return {"session_id": sess["session_id"], "code": sess["code"],
+                    "expires_at": sess["expires_at"]}, None, 200
+        # pending → approved：6 位数字码（含前导零 000000–999999 等概率，§23.2）
+        sess["state"] = "approved"
+        sess["code"] = "%06d" % secrets.randbelow(1000000)
+        sess["expires_at"] = time.time() + PAIR_CODE_TTL
+        sess["attempts"] = 0
+        return {"session_id": sess["session_id"], "code": sess["code"],
+                "expires_at": sess["expires_at"]}, None, 200
+
+
+def pair_reject():
+    """POST /v1/pair/reject 业务逻辑（契约 §23.3）：活跃会话 → 立即 voided
+    （被控端拒绝则连接不建立）；无活跃会话 → (None, err, 404)。"""
+    with PAIR_LOCK:
+        _pair_lazy_expire_locked()
+        sess = PAIR_SESSION
+        if sess is None or sess["state"] not in PAIR_ACTIVE_STATES:
+            return None, ("PAIR_NO_SESSION", "无可拒绝的配对会话"), 404
+        session_id = sess["session_id"]
+        sess["state"] = "voided"
+        return {"rejected": True, "session_id": session_id}, None, 200
+
+
+def pair_confirm(code, name):
+    """POST /v1/pair/confirm 业务逻辑（契约 §23.3）：码校验 → 签发身份令牌。
+
+    参数合法性由调用方先行校验（400 不消耗尝试次数）。返回 (data, err, status)：
+    - 成功：({token, identity, device_id, cert_fingerprint, node_version}, None, 200)，
+      会话转 consumed，新身份已写入配置文件与内存 IDENTITIES；
+    - 失败：err 为 (错误码, message)，会话按状态机转移（猜码达上限 → voided）。
+    """
+    with PAIR_LOCK:
+        _pair_lazy_expire_locked()
+        sess = PAIR_SESSION
+        if sess is None:
+            return None, ("PAIR_NO_SESSION", "无配对会话"), 404
+        if sess["state"] == "consumed":
+            return None, ("PAIR_NO_SESSION", "配对会话已消费（码已使用）"), 404
+        if sess["state"] == "voided":
+            return None, ("PAIR_NO_SESSION", "配对会话已作废"), 404
+        if sess["state"] == "pending":
+            return None, ("PAIR_NOT_APPROVED",
+                          "配对会话尚未经被控端本地确认"), 409
+        if sess["state"] == "expired":
+            return None, ("PAIR_EXPIRED", "配对码已过期，请重新发起配对"), 400
+        # approved：配对码常量时间比较（§23.2）
+        if not hmac.compare_digest(code.encode("utf-8"),
+                                   (sess["code"] or "").encode("utf-8")):
+            sess["attempts"] += 1
+            if sess["attempts"] >= PAIR_MAX_ATTEMPTS:
+                sess["state"] = "voided"        # 防暴力猜码：会话作废（§23.3）
+                return None, ("PAIR_ATTEMPTS_EXCEEDED",
+                              "配对码尝试已达上限 %d，会话已作废" % PAIR_MAX_ATTEMPTS), 403
+            left = PAIR_MAX_ATTEMPTS - sess["attempts"]
+            return None, ("PAIR_CODE_MISMATCH",
+                          "配对码不匹配，剩余可尝试次数：%d" % left), 401
+        # 码匹配 → 签发身份：name 冲突自动后缀 -2/-3…（§17.3 同款口径）
+        existing = {item["name"] for item in IDENTITIES}
+        effective = name
+        suffix = 2
+        while effective in existing:
+            effective = "%s-%d" % (name, suffix)
+            suffix += 1
+        if len(IDENTITIES) >= MAX_IDENTITIES:
+            # 身份列表满：会话保持 approved（可先 rm 身份腾位后重试，契约未定 voided）
+            return None, ("BAD_REQUEST", "身份列表已达上限 %d，无法签发新身份"
+                          % MAX_IDENTITIES), 400
+        token = uuid.uuid4().hex            # 32 hex（§2.1/D38，同既有生成口径）
+
+        def mutator(cfg):
+            tokens = cfg.get("tokens")
+            if not isinstance(tokens, list):
+                tokens = [{"name": item["name"], "token": item["token"]}
+                          for item in IDENTITIES]
+            tokens.append({"name": effective, "token": token})
+            cfg["tokens"] = tokens
+
+        persist_config(mutator)             # 原子写回 node.json tokens（§23.3）
+        IDENTITIES.append({"name": effective, "token": token})
+        sess["state"] = "consumed"          # 码一次性：consumed 即失效
+        return {"token": token, "identity": effective,
+                "device_id": DEVICE_ID, "cert_fingerprint": CERT_FINGERPRINT,
+                "node_version": NODE_VERSION}, None, 200
+
+
+# --------------------------------------------------------------------------
 # HTTP 服务
 # --------------------------------------------------------------------------
 
@@ -2332,6 +2566,7 @@ KNOWN_GET_PATHS = frozenset({
     "/", "/v1/health", "/v1/info", "/v1/fs/list", "/v1/fs/read",
     "/v1/fs/stat", "/v1/fs/checksum", "/v1/fs/download",
     "/v1/screen", "/v1/audit", "/v1/task/list",
+    "/v1/pair/session",                                     # M4 新增（§23，仅回环）
 })
 KNOWN_POST_PATHS = frozenset({
     "/v1/exec", "/v1/input", "/v1/fs/write", "/v1/self-update",
@@ -2340,6 +2575,8 @@ KNOWN_POST_PATHS = frozenset({
     "/v1/fs/upload/commit", "/v1/fs/upload/abort",
     "/v1/update/enroll", "/v1/update/pin",                  # S3 新增（§20）
     "/v1/elevate/install", "/v1/elevate/remove",            # S3 新增（§22）
+    "/v1/pair/begin", "/v1/pair/confirm",                   # M4 新增（§23，私网）
+    "/v1/pair/approve", "/v1/pair/reject",                  # M4 新增（§23，仅回环）
 })
 
 
@@ -2474,6 +2711,100 @@ class Handler(BaseHTTPRequestHandler):
             return (409, "REPLAY_DETECTED", "重复的 nonce（疑似重放）")
         return None
 
+    # ---- pair 族 guard 变体与分发（契约 V1.5 §23.1：免令牌免防重放，§1.2 唯一例外）----
+    def guard_pair(self, parsed):
+        """pair 族来源校验（§2.3 变体）：① 私网来源照常；② 回环限定端点另加
+        仅 127.0.0.1/::1 检查。跳过令牌与防重放校验（既有 guard 链本体零改动）。
+
+        通过返回 True；失败已发送响应。非私网 403 不落审计（§8.2 既有口径）；
+        回环限定拒绝 403 是通过①后的来源限定拒绝——要落审计（identity=""）。
+        """
+        client = self.client_address[0]
+        if not is_private(client):
+            self.fail("FORBIDDEN", "仅允许局域网访问：%s" % client, 403)
+            return False
+        if parsed.path in PAIR_LOOPBACK_PATHS and not is_loopback(client):
+            self.audit(parsed, identity="", result=403, code="FORBIDDEN")
+            self.fail("FORBIDDEN",
+                      "该端点仅允许本机回环（127.0.0.1/::1）访问：%s" % client, 403)
+            return False
+        return True
+
+    def dispatch_pair(self, parsed):
+        """/v1/pair/* 分发入口：guard 变体 → pair 路由 → finally 审计。
+        全族审计 identity 一律空字符串（§23.5）；码值/令牌永不入 target。"""
+        if not self.guard_pair(parsed):
+            return
+        try:
+            self.route_pair(parsed)
+        except Exception as exc:
+            self.fail("INTERNAL", str(exc), 500)
+        finally:
+            self.audit(parsed, identity="",
+                       result=self._resp_status if self._resp_status is not None else 500,
+                       code=self._resp_code)
+
+    def route_pair(self, parsed):
+        """pair 族路由：按 方法+路径 分发；不匹配组合 → 404（同 _unknown_route 口径）。"""
+        path = parsed.path
+        if self.command == "GET":
+            if path == "/v1/pair/session":
+                data = pair_session_snapshot()
+                self.ok(data)
+                return
+        elif self.command == "POST":
+            # begin 永不 set_target（§8.3 一律空）；approve/reject 成功前 set_target
+            if path == "/v1/pair/begin":
+                self.read_body()                     # 空体或 {}（排空请求体保 keep-alive）
+                data, err, status = pair_begin(self.client_address[0])
+                if err:
+                    self.fail(err[0], err[1], status)
+                else:
+                    self.ok(data)
+                return
+            if path == "/v1/pair/approve":
+                self.read_body()
+                data, err, status = pair_approve()
+                if err:
+                    self.fail(err[0], err[1], status)
+                else:
+                    self.set_target("session=%s" % data["session_id"])
+                    self.ok(data)
+                return
+            if path == "/v1/pair/reject":
+                self.read_body()
+                data, err, status = pair_reject()
+                if err:
+                    self.fail(err[0], err[1], status)
+                else:
+                    self.set_target("session=%s" % data["session_id"])
+                    self.ok(data)
+                return
+            if path == "/v1/pair/confirm":
+                self.route_pair_confirm()
+                return
+        self.fail("NOT_FOUND", "未知接口或方法：%s %s" % (self.command, path), 404)
+
+    def route_pair_confirm(self):
+        """POST /v1/pair/confirm（契约 §23.3）：参数校验（400 不消耗尝试次数）→
+        码校验 → 签发。成功 set_target("name=<生效名>")；失败路径一律不 set_target
+        （§8.3：确认族失败 target 空，配对码值永不落审计）。"""
+        body = self.read_body()
+        code = body.get("code")
+        name = body.get("name")
+        if not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}", code):
+            self.fail("BAD_REQUEST", "code 必须是 6 位数字字符串", 400)
+            return
+        if not isinstance(name, str) or not 1 <= len(name) <= 64:
+            self.fail("BAD_REQUEST", "name 必须是 1–64 字符的字符串", 400)
+            return
+        data, err, status = pair_confirm(code, name)
+        if err:
+            self.fail(err[0], err[1], status)
+            return
+        self.set_target("name=%s" % data["identity"])
+        self.ok(data)
+
     # ---- 分发入口：鉴权 → 路由 → 审计 ----
     def dispatch(self, router):
         self._resp_status = None
@@ -2481,6 +2812,11 @@ class Handler(BaseHTTPRequestHandler):
         self._audit_target = ""
         self._identity = ""
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/v1/pair/"):
+            # V1.5 §23：pair 族按路径前缀分流走 guard 变体（免令牌免防重放），
+            # 既有 guard()/check_replay() 本体与非 pair 路径行为零改动（E-02）
+            self.dispatch_pair(parsed)
+            return
         identity = self.guard(parsed)
         if identity is None:
             return
