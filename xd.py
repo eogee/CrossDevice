@@ -45,8 +45,10 @@ import json
 import msvcrt
 import os
 import re
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -1443,6 +1445,12 @@ def cmd_elevate(args, registry):
         return
     print("已安装高权限驻留计划任务 %s（开机登录后以最高权限自启）"
           % (data.get("task_name") or "-"))
+    # B32 一期轻量形态（D40 / 契约 V1.4 变更记录）：安装成功后补一行白名单首次配置指引。
+    # 文案为最终输出原文（README"首次配置"小节同款，勿偏离）；本行不用 % 格式化，
+    # %LOCALAPPDATA% 按字面输出；仅新增文案不改既有语义（E-02）。
+    print("白名单首次配置：编辑被控端 node.json（默认 %LOCALAPPDATA%\\CrossDevice\\node.json）"
+          "的 \"workspace\" 键（字符串数组，默认空=拒绝一切写入/删除），"
+          "如 \"workspace\": [\"D:\\\\Shared\"]；或启动 node 时加 --workspace \"D:\\\\Shared\"。")
 
 
 # --------------------------------------------------------------------------
@@ -1558,6 +1566,106 @@ def cmd_mv(args, registry):
 
 
 # --------------------------------------------------------------------------
+# S4 新增本地命令（契约 §11 兼容清单 V1.4：`xd cert init`，B26/D32 收口）。
+# 纯本地命令：不新增端点、不碰 guard 链/防重放/注册表与设备连接，
+# 不读不写 data/devices.json（registry 参数仅保持子命令签名一致）。
+# --------------------------------------------------------------------------
+
+def _cert_fingerprint(cert_path):
+    """证书 PEM → DER 的 SHA-256 小写 64 hex（契约 §4.1 指纹口径，同
+    tools/verify_cert.py 与 node 侧指纹计算）。"""
+    text = Path(cert_path).read_bytes().decode("utf-8-sig")
+    b64 = "".join(line.strip() for line in text.splitlines()
+                  if line.strip() and not line.startswith("-----"))
+    der = base64.b64decode(b64)
+    return hashlib.sha256(der).hexdigest()
+
+
+def _cert_manual_cmd(script, out_dir, days, force, host):
+    """gen_cert.ps1 的完整手动命令行（PowerShell 缺失/失败时的恢复指引）。"""
+    parts = ["powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\"" % script,
+             "-OutDir \"%s\"" % out_dir, "-Days %d" % days]
+    if force:
+        parts.append("-Force")
+    if host:
+        parts.append("-HostName \"%s\"" % host)
+    return " ".join(parts)
+
+
+def cmd_cert(args, registry):
+    """自签证书生成壳命令（契约 §11 V1.4 行 / §4.1）：subprocess 调
+    tools/gen_cert.ps1（-OutDir/-Days/-Force/-HostName 一一映射），默认输出目录
+    %LOCALAPPDATA%\\CrossDevice\\tls\\ 即 node 默认 TLS 目录。目标目录已有
+    cert.pem/key.pem 且未给 --force → 本地明确报错退出（防误覆盖，与
+    gen_cert.ps1 覆盖检查一致，不必先跑 PowerShell）；PowerShell 缺失/失败 →
+    明确报错并给出手动运行 gen_cert.ps1 的完整命令行。成功输出生成路径 +
+    SHA-256 指纹（§4.1 口径，Python 侧解析 PEM 自行计算）+ 下一步提示。"""
+    script = ROOT / "tools" / "gen_cert.ps1"
+    if not script.is_file():
+        raise SystemExit("找不到证书生成脚本：%s\n"
+                         "cert init 依赖仓库内的 tools/gen_cert.ps1，"
+                         "请在完整检出的仓库目录中运行" % script)
+
+    # 默认输出目录 = node 默认 TLS 目录（契约 §4.1/§9.1）
+    if args.out:
+        out_dir = Path(args.out)
+    else:
+        lad = os.environ.get("LOCALAPPDATA")
+        if not lad:
+            raise SystemExit("无法确定默认输出目录（%LOCALAPPDATA% 未设置），"
+                             "请用 --out 显式指定")
+        out_dir = Path(lad) / "CrossDevice" / "tls"
+    out_dir = Path(os.path.abspath(str(out_dir)))
+    cert_path, key_path = out_dir / "cert.pem", out_dir / "key.pem"
+
+    # Python 侧预检查：目标目录已有 cert.pem 或 key.pem 且未给 --force → 直接拒绝
+    existing = [p.name for p in (cert_path, key_path) if p.exists()]
+    if existing and not args.force:
+        raise SystemExit(
+            "拒绝覆盖：目标目录已存在 %s（%s）\n"
+            "如确认轮换证书请加 --force；旧证书指纹若已被控制端登记（TOFU），"
+            "轮换后需 xd add 重录或对既有设备加 --trust" % (" / ".join(existing), out_dir))
+
+    manual = _cert_manual_cmd(script, out_dir, args.days, args.force, args.host)
+    ps = shutil.which("powershell")
+    if not ps:
+        raise SystemExit("未找到 PowerShell（shutil.which(\"powershell\") 为空），"
+                         "无法调用证书生成脚本。\n"
+                         "请手动执行等价命令生成证书：\n  %s" % manual)
+
+    cmd = [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+           "-OutDir", str(out_dir), "-Days", str(args.days)]
+    if args.force:
+        cmd.append("-Force")
+    if args.host:
+        cmd += ["-HostName", args.host]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit("调用 PowerShell 失败：%r\n"
+                         "请手动执行等价命令生成证书：\n  %s" % (exc, manual))
+
+    if proc.returncode != 0 or not cert_path.is_file() or not key_path.is_file():
+        tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()[-600:]
+        raise SystemExit("证书生成失败（gen_cert.ps1 退出码 %s），输出尾部：\n%s\n"
+                         "请手动执行等价命令重试：\n  %s"
+                         % (proc.returncode, tail or "<无输出>", manual))
+
+    fingerprint = _cert_fingerprint(cert_path)
+    print("证书已生成：")
+    print("  cert.pem : %s" % cert_path)
+    print("  key.pem  : %s" % key_path)
+    print("  SHA-256 指纹（契约 §4.1 口径，证书 DER，小写 64 hex）: %s" % fingerprint)
+    if args.out:
+        print("下一步：该目录不是 node 默认 TLS 目录，请以 node 启动参数 --cert/--key "
+              "或 node.json 的 tls.cert/tls.key 显式指向上述文件后重启 node。")
+    else:
+        print("下一步：默认目录即 node 默认 TLS 目录（node.json 的 tls.cert/tls.key "
+              "缺省即指向此处），重启 node 后生效。")
+
+
+# --------------------------------------------------------------------------
 # 入口
 # --------------------------------------------------------------------------
 
@@ -1614,7 +1722,9 @@ def build_parser():
     p.add_argument("name")
     p.add_argument("-o", "--output", default=None)
     p.add_argument("--monitor", type=int, default=-1)
-    p.add_argument("--max-width", type=int, default=1600)
+    p.add_argument("--max-width", type=int, default=0,
+                   help="等比缩放宽度（0=原始分辨率不缩放，FR-05/D18 默认；"
+                        "带宽受限场景显式指定，如 1600）")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_shot)
 
@@ -1764,6 +1874,22 @@ def build_parser():
     p.add_argument("--remove", action="store_true", help="移除驻留计划任务（幂等）")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_elevate)
+
+    # S4 新增本地命令（契约 §11 兼容清单 V1.4）：cert init 为纯本地命令，
+    # 不挂 common 父解析器（非设备类，无 --trust/--json）。
+    p = sub.add_parser("cert", help="本地证书工具（S4/B26，纯本地，不涉网络与设备注册表）")
+    cert_sub = p.add_subparsers(dest="cert_action", required=True)
+    cp = cert_sub.add_parser(
+        "init", help="生成自签证书（TLS 1.3/TOFU 用，调 tools/gen_cert.ps1，契约 §4.1/§11）")
+    cp.add_argument("--out", default=None,
+                    help="输出目录（默认 %%LOCALAPPDATA%%\\CrossDevice\\tls\\，即 node 默认 TLS 目录）")
+    cp.add_argument("--days", type=int, default=3650,
+                    help="证书有效期天数（默认 3650，与 gen_cert.ps1 一致）")
+    cp.add_argument("--force", action="store_true",
+                    help="覆盖目标目录已有的 cert.pem / key.pem（轮换证书）")
+    cp.add_argument("--host", default=None,
+                    help="证书 CN（缺省用 %%COMPUTERNAME%%，由 gen_cert.ps1 处理）")
+    cp.set_defaults(func=cmd_cert)
 
     return parser
 
