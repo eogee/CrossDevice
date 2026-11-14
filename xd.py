@@ -2,12 +2,22 @@
 # -*- coding: utf-8 -*-
 """CrossDevice CLI —— 本机侧入口，不监听任何端口。
 
-S1 安全基线改造（唯一行为依据 docs/接口契约.md V1.0）：
+S1 安全基线改造（唯一行为依据 docs/接口契约.md）：
   - 传输层 HTTPS（TLS 1.3，自签证书 + TOFU 指纹固定，契约第 4 章）；
   - 每个请求携带防重放头 X-Timestamp / X-Nonce，每次请求独立 nonce（契约第 3 章）；
   - 注册表加固：msvcrt 文件锁 + 原子写，修改统一走 registry_update（契约 9.2）；
   - `add` 新增可选 --identity 身份名；设备类子命令新增可选 --trust 确认指纹变更；
   - 新增 `audit ls` / `audit export` 子命令（契约 8.4）。
+S2 能力扩展（契约 V1.2，§13/§14/§17/§18）：
+  - `put`/`get` 升级为流式协议：4MB 分块 begin/chunk/commit 上传（断点续传）与
+    /v1/fs/download 分块下载（本地断点文件 <local>.crosspart，Range 续拉），
+    取消 64MB 上限；专用流式传输层（复用 _connect_tls 的 TOFU 校验，不走 request()）；
+  - 新增子命令：`wheel` / `task ls` / `task show` / `del`（文件删除，需 --yes，
+    偏差 6）/ `mkdir` / `mv`；
+  - `add` 增强：--port 默认 51888（偏差 7）、条目记录 mac/ips、命名冲突自动后缀
+    （未指定 --name 时）或报错（显式 --name 时）；
+  - `resolve` 两级漂移兜底：条目 ips 逐试 → 主机名重扫 → MAC 兜底（共用一次扫描，
+    契约 17.4），一切注册表写路径经 registry_update。
 既有子命令的输出格式与语义保持不变（E-02，兼容清单第 11 章）。
 """
 
@@ -35,6 +45,10 @@ NODE_SOURCE = ROOT / "node" / "node.py"
 
 LOCK_TIMEOUT = 5.0                   # 注册表文件锁等待上限（秒），契约 9.2
 TRUST_HELP = "确认并接受服务器证书指纹变更（TOFU）"
+
+# 流式传输参数（契约 §13：4MB 分块上传；本地读写/MD5 计算缓冲 1MB，不整载文件）
+CHUNK_SIZE = 4 * 1024 * 1024
+IO_BUFFER = 1024 * 1024
 
 
 # --------------------------------------------------------------------------
@@ -69,7 +83,8 @@ def _atomic_write_text(path, text):
 
 
 def _normalize_registry(registry):
-    """写回前补齐 S1 新增键（契约 9.2：旧条目任何写回操作补齐 identity / cert_fingerprint）。"""
+    """写回前补齐新增键（契约 9.2 / 17.2：旧条目任何写回操作补齐
+    identity / cert_fingerprint（S1）与 mac / ips（S2））。"""
     devices = registry.get("devices")
     if not isinstance(devices, dict):
         registry["devices"] = {}
@@ -79,6 +94,8 @@ def _normalize_registry(registry):
             device.setdefault("name", name)
             device.setdefault("identity", "default")
             device.setdefault("cert_fingerprint", "")
+            device.setdefault("mac", "")          # S2：MAC，缺省空（契约 9.2）
+            device.setdefault("ips", [])          # S2：全部私网 IPv4 列表
     return registry
 
 
@@ -282,6 +299,143 @@ def request(device, method, path, payload=None, timeout=30, raw=False, trust=Fal
     return parsed["data"]
 
 
+# --------------------------------------------------------------------------
+# 流式传输层（契约 §13 / §18.1：put/get 大文件分块读写，不得走 request() 全量读响应体）
+# --------------------------------------------------------------------------
+
+def _stream_open(device, method, path, body=None, headers=None, timeout=60, trust=False):
+    """流式传输底层：建立 TLS 连接（复用 _connect_tls 的 TOFU 指纹校验，规则不变），
+    发送请求（body 为调用方按分块构造的请求体字节，不整载文件）。
+
+    返回 (conn, resp)：调用方负责分块读 resp（可取 X-File-Size / X-File-MD5 /
+    Content-Range 等响应头）并 finally 关闭 conn。
+    每个请求独立生成 nonce 与当前时间戳（契约 3.3）。
+    """
+    try:
+        conn = _connect_tls(device, timeout, trust=trust)
+    except TimeoutError as exc:
+        raise RuntimeError("请求超时 %s:%d" % (device["ip"], device["port"])) from exc
+    except (http.client.HTTPException, OSError) as exc:
+        raise RuntimeError("无法连接 %s:%d（%s）" % (device["ip"], device["port"], exc)) from exc
+    try:
+        hdrs = {
+            "X-Auth-Token": device["token"],
+            "X-Timestamp": str(int(time.time())),
+            "X-Nonce": uuid.uuid4().hex,
+        }
+        if body is not None:
+            hdrs["Content-Type"] = "application/json"
+        if headers:
+            hdrs.update(headers)
+        conn.request(method, path, body=body, headers=hdrs)
+        resp = conn.getresponse()
+        return conn, resp
+    except TimeoutError as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise RuntimeError("请求超时 %s:%d" % (device["ip"], device["port"])) from exc
+    except (http.client.HTTPException, OSError) as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise RuntimeError("无法连接 %s:%d（%s）" % (device["ip"], device["port"], exc)) from exc
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+
+
+def _stream_error(resp, body):
+    """流式响应失败时按包络解出错误码（契约 1.3：失败一律 JSON 包络）。"""
+    try:
+        err = json.loads(body.decode("utf-8")).get("error", {})
+    except Exception:
+        err = {}
+    if err:
+        raise RuntimeError("%s: %s" % (err.get("code"), err.get("message")))
+    raise RuntimeError("HTTP %d %s" % (resp.status, body[:200]))
+
+
+def _stream_json(device, method, path, payload=None, timeout=60, trust=False):
+    """流式传输族的 JSON 端点调用（upload begin/chunk/commit/abort 等）：
+    走 _stream_open 建连，响应体较小整体读入后按包络解包。"""
+    body = None
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    conn, resp = _stream_open(device, method, path, body=body, timeout=timeout, trust=trust)
+    try:
+        data = resp.read()
+        status = resp.status
+    except TimeoutError as exc:
+        raise RuntimeError("请求超时 %s:%d" % (device["ip"], device["port"])) from exc
+    except (http.client.HTTPException, OSError) as exc:
+        raise RuntimeError("无法连接 %s:%d（%s）" % (device["ip"], device["port"], exc)) from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if status >= 400:
+        _stream_error(resp, data)
+    parsed = json.loads(data.decode("utf-8"))
+    if not parsed.get("ok"):
+        err = parsed.get("error", {})
+        raise RuntimeError("%s: %s" % (err.get("code"), err.get("message")))
+    return parsed["data"]
+
+
+def _file_md5_and_size(path):
+    """分块流式计算文件 MD5 与大小（1MB 缓冲，不整载，契约 §13.1 同口径）。"""
+    digest = hashlib.md5()
+    size = 0
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(IO_BUFFER)
+            if not block:
+                break
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
+
+
+def _download_url(remote):
+    return "/v1/fs/download?" + urllib.parse.urlencode({"path": remote})
+
+
+def _download_probe(device, remote, trust=False):
+    """下载前探测远端总长与 MD5（断点续传判定用）。
+
+    契约 §13.2 仅支持闭区间 Range，故以 bytes=0-0 取 206 响应头
+    X-File-Size / X-File-MD5；服务端忽略 Range 回 200 时丢弃响应体后同样返回头信息。
+    """
+    conn, resp = _stream_open(device, "GET", _download_url(remote),
+                              headers={"Range": "bytes=0-0"}, timeout=30, trust=trust)
+    try:
+        if resp.status >= 400:
+            body = resp.read()
+            _stream_error(resp, body)
+        size_text = resp.getheader("X-File-Size")
+        md5 = resp.getheader("X-File-MD5") or None
+        total = int(size_text) if size_text and size_text.isdigit() else None
+        if resp.status != 206:
+            # 服务端不支持 Range（200 全量）：丢弃响应体，头信息仍有效
+            while True:
+                block = resp.read(IO_BUFFER)
+                if not block:
+                    break
+        return total, md5
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def probe(device, timeout=2.0, trust=False):
     try:
         request(device, "GET", "/v1/health", timeout=timeout, trust=trust)
@@ -294,38 +448,80 @@ def probe(device, timeout=2.0, trust=False):
         return False
 
 
-def rediscover(device):
-    """地址漂移时按主机名重新定位。"""
-    hostname = (device.get("info") or {}).get("hostname")
-    if not hostname:
-        return None
-    result = discover.scan()
-    for found in result["devices"]:
-        if found.get("hostname") and found["hostname"].lower() == hostname.lower():
-            return found["ip"]
-    return None
+def _switch_device_ip(name, device, new_ip):
+    """漂移命中：切换内存地址并经 registry_update 落盘（契约 17.4，
+    一切注册表写路径必须经由 registry_update，禁止绕过）。"""
+    device["ip"] = new_ip
+    device["last_seen"] = time.time()
+
+    def apply_drift(entry):
+        entry["ip"] = new_ip
+        entry["last_seen"] = device["last_seen"]
+
+    _persist_device(name, apply_drift)
+    return device
 
 
 def resolve(registry, name, trust=False):
+    """解析设备并确保可达（契约 17.4 两级漂移兜底）：
+
+    ① 现地址（ip:port）探测成功 → 返回（行为同现状，不写盘）；
+    ② 失败 → 逐个尝试条目 ips 中其余地址，首个成功者经 registry_update 落盘切换；
+    ③ 仍失败 → 主机名重扫（discover.scan，大小写不敏感匹配 info.hostname）；
+    ④ 仍失败 → MAC 兜底（条目 mac 非空时在同一扫描结果中匹配）；
+       主机名与 MAC 兜底共用同一次扫描结果；全部失败维持现有离线报错。
+    """
     devices = registry["devices"]
     if name in devices:
         device = devices[name]
         if probe(device, trust=trust):
             device["last_seen"] = time.time()
             return device
-        new_ip = rediscover(device)
-        if new_ip and new_ip != device["ip"]:
-            print("地址漂移：%s %s -> %s" % (name, device["ip"], new_ip))
-            device["ip"] = new_ip
-            device["last_seen"] = time.time()
 
-            def apply_drift(entry):
-                entry["ip"] = new_ip
-                entry["last_seen"] = device["last_seen"]
+        # ② 条目 ips 中其余地址逐个尝试
+        for ip in device.get("ips") or []:
+            if not ip or ip == device["ip"]:
+                continue
+            trial = dict(device, ip=ip)
+            if probe(trial, trust=trust):
+                print("地址漂移：%s %s -> %s" % (name, device["ip"], ip))
+                return _switch_device_ip(name, device, ip)
 
-            _persist_device(name, apply_drift)
-            if probe(device, trust=trust):
-                return device
+        # ③④ 主机名重扫 + MAC 兜底共用一次扫描（扫描失败视为无候选）
+        scan_result = {"devices": []}
+        scanned = False
+        hostname = (device.get("info") or {}).get("hostname")
+        if hostname:
+            try:
+                scan_result = discover.scan()
+            except Exception:
+                scan_result = {"devices": []}
+            scanned = True
+            for found in scan_result.get("devices", []):
+                found_ip = found.get("ip")
+                if (found.get("hostname") or "").lower() == hostname.lower() \
+                        and found_ip and found_ip != device["ip"]:
+                    trial = dict(device, ip=found_ip)
+                    if probe(trial, trust=trust):
+                        print("地址漂移：%s %s -> %s" % (name, device["ip"], found_ip))
+                        return _switch_device_ip(name, device, found_ip)
+
+        mac = (device.get("mac") or "").strip().upper()
+        if mac:
+            if not scanned:
+                try:
+                    scan_result = discover.scan()
+                except Exception:
+                    scan_result = {"devices": []}
+            for found in scan_result.get("devices", []):
+                found_ip = found.get("ip")
+                if ((found.get("mac") or "").strip().upper() == mac
+                        and found_ip and found_ip != device["ip"]):
+                    trial = dict(device, ip=found_ip)
+                    if probe(trial, trust=trust):
+                        print("地址漂移：%s %s -> %s" % (name, device["ip"], found_ip))
+                        return _switch_device_ip(name, device, found_ip)
+
         raise SystemExit("设备 %s 离线（%s）" % (name, device["ip"]))
 
     for device in devices.values():
@@ -356,6 +552,16 @@ def _trust(args):
 
 def _truncate(text, width):
     return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def _transient_replace_error(exc):
+    """识别 Windows os.replace 的瞬时拒绝访问（目标文件被实时扫描等短暂占用）。
+
+    服务端 commit 落盘与本地断点转正都可能遇到 WinError 5；与"MD5 不一致"
+    等永久错误区分开，瞬时错误允许短重试。
+    """
+    text = str(exc)
+    return "拒绝访问" in text or "WinError 5" in text or "落盘失败" in text
 
 
 # --------------------------------------------------------------------------
@@ -450,6 +656,10 @@ def cmd_discover(args, registry):
 
 
 def cmd_add(args, registry):
+    # 显式 --name 冲突 → 报错退出（契约 17.3：显式意图优先，不静默改名）
+    if args.name and args.name in registry["devices"]:
+        raise SystemExit("设备名称已存在：%s（显式命名的冲突不做自动改名，"
+                         "请换名或先 rm 旧条目）" % args.name)
     device = {
         "name": args.name or "",
         "ip": args.ip,
@@ -457,6 +667,8 @@ def cmd_add(args, registry):
         "token": args.token,
         "identity": args.identity or "default",
         "cert_fingerprint": "",
+        "mac": discover.arp_table().get(args.ip, ""),   # S2：ARP 表采集 MAC（只读，契约 17.3）
+        "ips": [],
         "added_at": time.time(),
         "last_seen": None,
         "info": {},
@@ -465,9 +677,18 @@ def cmd_add(args, registry):
     info = request(device, "GET", "/v1/info", timeout=8, trust=True)
     device["info"] = info
     device["last_seen"] = time.time()
-    name = args.name or info["hostname"]
+    # S2：条目记录 ips（取 /v1/info 的 addresses，契约 17.3；旧 node 无该字段则留空）
+    device["ips"] = [a for a in (info.get("addresses") or [])
+                     if isinstance(a, str) and a]
+    base = args.name or info.get("hostname") or args.ip
+    # 未指定 --name（取 hostname）且名称已存在 → 自动后缀 -2、-3…（契约 17.3）
+    name = base
+    if not args.name:
+        suffix = 2
+        while name in registry["devices"]:
+            name = "%s-%d" % (base, suffix)
+            suffix += 1
     device["name"] = name
-    registry["devices"][name] = device
 
     def fn(reg):
         reg["devices"][name] = device
@@ -665,27 +886,159 @@ def cmd_cat(args, registry):
 
 
 def cmd_put(args, registry):
+    """流式上传（契约 §18.1 / §13.3）：begin → 4MB 分块 chunk → commit。
+
+    - begin 返回 resume_offset > 0 时跳过已接收块续传（不重传，断点续传）；
+    - --fresh：先 begin 拿到既有会话 id（若复用）→ abort 它 → 重新 begin 全新上传；
+    - commit 返回的 md5 与本地不一致 → 报错；
+    - commit 落盘遇到 Windows 瞬时占用（WinError 5）→ 重新 begin 后重试
+      （服务端若已清理会话则按 resume_offset=0 重传，断点续传语义天然兼容）。
+    """
     device = resolve(registry, args.name, trust=_trust(args))
-    payload = Path(args.local).read_bytes()
-    result = request(device, "POST", "/v1/fs/write", {
-        "path": args.remote,
-        "data_b64": base64.b64encode(payload).decode("ascii"),
-    }, timeout=120, trust=_trust(args))
+    local = Path(args.local)
+    if not local.is_file():
+        raise SystemExit("本地文件不存在：%s" % local)
+    md5, size = _file_md5_and_size(local)
+
+    begin_payload = {"path": args.remote, "size": size, "md5": md5}
+    fresh_pending = args.fresh            # 仅首轮执行 abort（重试轮不再 abort）
+    attempt = 0
+    while True:
+        attempt += 1
+        data = _stream_json(device, "POST", "/v1/fs/upload/begin", begin_payload,
+                            timeout=30, trust=_trust(args))
+        if fresh_pending:
+            fresh_pending = False
+            # 全新上传：终止既有会话（含服务端临时文件清理）后重新 begin
+            _stream_json(device, "POST", "/v1/fs/upload/abort",
+                         {"upload_id": data["upload_id"]}, timeout=30, trust=_trust(args))
+            data = _stream_json(device, "POST", "/v1/fs/upload/begin", begin_payload,
+                                timeout=30, trust=_trust(args))
+        upload_id = data["upload_id"]
+        chunk_size = int(data.get("chunk_size") or CHUNK_SIZE)
+        offset = int(data.get("resume_offset") or 0)
+
+        with open(local, "rb") as fh:
+            fh.seek(offset)               # 跳过已接收部分（断点续传）
+            while offset < size:
+                block = fh.read(chunk_size)
+                if not block:
+                    break
+                result = _stream_json(device, "POST", "/v1/fs/upload/chunk",
+                                      {"upload_id": upload_id, "offset": offset,
+                                       "data_b64": base64.b64encode(block).decode("ascii")},
+                                      timeout=120, trust=_trust(args))
+                offset = int(result.get("next_offset") or (offset + len(block)))
+
+        try:
+            result = _stream_json(device, "POST", "/v1/fs/upload/commit",
+                                  {"upload_id": upload_id}, timeout=60, trust=_trust(args))
+            break
+        except RuntimeError as exc:
+            if attempt >= 3 or not _transient_replace_error(exc):
+                raise
+            print("服务端落盘被瞬时占用，重新 begin 后重试（%d/3）..." % attempt)
+            time.sleep(0.5)
+    if (result.get("md5") or "").lower() != md5:
+        raise RuntimeError("上传校验失败：服务端 MD5 与本地不一致（本地 %s / 远端 %s）"
+                           % (md5, result.get("md5")))
     print("已上传 %s -> %s（%s）" % (
-        args.local, result["path"], human_size(result["written"])))
+        args.local, result["path"], human_size(result.get("size") or size)))
 
 
 def cmd_get(args, registry):
+    """流式下载（契约 §18.1 / §13.2）：改用 /v1/fs/download 分块拉取。
+
+    - 本地断点文件 <local>.crosspart：存在且 < 总长 → 以 Range 续拉并追加；
+      ≥ 总长（异常残留）→ 丢弃重来；
+    - 完成且 MD5 校验一致后 os.replace 为目标文件；校验不一致报错并保留断点文件；
+    - --fresh 删除断点重新下载；--max 参数保留但不再使用（静默忽略）；取消 64MB 上限。
+    """
     device = resolve(registry, args.name, trust=_trust(args))
-    data = request(device, "GET", "/v1/fs/read?" + urllib.parse.urlencode(
-        {"path": args.remote, "max": args.max}), timeout=180, trust=_trust(args))
-    if "data_b64" in data:
-        payload = base64.b64decode(data["data_b64"])
-    else:
-        payload = data["text"].encode("utf-8")
-    Path(args.local).write_bytes(payload)
+    local = Path(args.local)
+    if local.parent and not local.parent.exists():
+        raise SystemExit("目标目录不存在：%s" % local.parent)
+    part = Path(str(local) + ".crosspart")      # 本地断点文件
+    if args.fresh and part.exists():
+        try:
+            part.unlink()
+        except OSError:
+            pass
+
+    total = None                                # 远端文件总字节数（来自 X-File-Size）
+    remote_md5 = None
+    offset = 0
+    if part.exists():
+        offset = part.stat().st_size
+        # 先探测总长，判定断点是否可用（契约 §13.2 仅支持闭区间 Range）
+        probed_total, probed_md5 = _download_probe(device, args.remote, trust=_trust(args))
+        if probed_total is None:
+            offset = 0                          # 无法确定总长：断点不可靠，全量重来
+        elif offset >= probed_total:
+            offset = 0                          # 断点 ≥ 总长（异常残留）→ 丢弃重来
+        else:
+            total, remote_md5 = probed_total, probed_md5
+
+    headers = None
+    if offset > 0:
+        # 断点续拉：闭区间 Range（bytes=<已收>-<总长-1>），追加写入
+        headers = {"Range": "bytes=%d-%d" % (offset, total - 1)}
+    conn, resp = _stream_open(device, "GET", _download_url(args.remote),
+                              headers=headers, timeout=60, trust=_trust(args))
+    try:
+        if resp.status >= 400:
+            body = resp.read()
+            _stream_error(resp, body)
+        if resp.status == 200:
+            # 全量响应（无断点或服务端忽略 Range）→ 断点作废，从头写
+            offset = 0
+        elif resp.status == 206:
+            match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+)",
+                             resp.getheader("Content-Range") or "")
+            if not match or int(match.group(1)) != offset:
+                raise RuntimeError("下载续传失败：Content-Range 与断点不符（%s）"
+                                   % (resp.getheader("Content-Range") or "无"))
+        else:
+            body = resp.read()
+            raise RuntimeError("HTTP %d（下载被拒绝）" % resp.status)
+        size_text = resp.getheader("X-File-Size")
+        if size_text and size_text.isdigit():
+            total = int(size_text)
+        remote_md5 = resp.getheader("X-File-MD5") or remote_md5
+        received = offset
+        with open(part, "ab" if offset else "wb") as fh:
+            while True:
+                block = resp.read(IO_BUFFER)
+                if not block:
+                    break
+                fh.write(block)
+                received += len(block)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if total is None:
+        total = received                        # 服务端未带 X-File-Size（异常 node）→ 以实收为准
+    if received != total:
+        raise RuntimeError("下载不完整：%d/%d 字节（断点文件已保留，重新执行 get 可续传）"
+                           % (received, total))
+    actual_md5, _ = _file_md5_and_size(part)
+    if remote_md5 and actual_md5.lower() != remote_md5.lower():
+        raise RuntimeError("下载校验失败：MD5 与服务端不一致（断点文件已保留，"
+                           "可加 --fresh 重新下载）")
+    for attempt in range(3):
+        try:
+            os.replace(part, local)         # 断点文件转正为目标文件（同目录原子替换）
+            break
+        except PermissionError as exc:
+            # 目标文件被实时扫描等短暂占用（WinError 5）→ 短重试
+            if attempt == 2 or not _transient_replace_error(exc):
+                raise
+            time.sleep(0.5)
     print("已下载 %s -> %s（%s）" % (
-        args.remote, args.local, human_size(len(payload))))
+        args.remote, args.local, human_size(total)))
 
 
 def cmd_push_node(args, registry):
@@ -708,6 +1061,118 @@ def cmd_push_node(args, registry):
 
 
 # --------------------------------------------------------------------------
+# S2 新增命令（契约 §18：wheel / task ls / task show / del / mkdir / mv）
+# --------------------------------------------------------------------------
+
+def cmd_wheel(args, registry):
+    """滚轮（delta 可负，负值向上）：走 /v1/input 的 wheel 动作，输出沿用 send_input。"""
+    send_input(args, registry, [{"type": "wheel", "delta": args.delta}])
+
+
+def _task_time(value):
+    """任务时间戳 → 本地时间文本（表格/详情用）。"""
+    try:
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(float(value)))
+    except Exception:
+        return "-"
+
+
+def cmd_task_list(args, registry):
+    """任务历史列表（契约 §15.2 / §18）：表格含开始时间/任务ID/状态/退出码/命令摘要。"""
+    device = resolve(registry, args.name, trust=_trust(args))
+    params = {}
+    if getattr(args, "status", None):
+        params["status"] = args.status
+    if getattr(args, "limit", None) is not None:
+        params["limit"] = int(args.limit)
+    query = urllib.parse.urlencode(params)
+    data = request(device, "GET", "/v1/task/list" + ("?" + query if query else ""),
+                   timeout=30, trust=_trust(args))
+    entries = data.get("entries", []) if isinstance(data, dict) else []
+    total = data.get("total", len(entries)) if isinstance(data, dict) else len(entries)
+    if args.json:
+        dump(data)
+        return
+    print("%-17s %-14s %-9s %-8s %s" % ("开始时间", "任务ID", "状态", "退出码", "命令"))
+    print("-" * 96)
+    for entry in entries:
+        exit_code = entry.get("exit_code")
+        print("%-17s %-14s %-9s %-8s %s" % (
+            _task_time(entry.get("started_at")),
+            _truncate(str(entry.get("id") or "-"), 14),
+            _truncate(str(entry.get("status") or "-"), 9),
+            "-" if exit_code is None else str(exit_code),
+            _truncate(str(entry.get("cmd") or "-").replace("\n", " "), 42)))
+    print("-" * 96)
+    print("共 %d 条（总计 %s）" % (len(entries), total))
+
+
+def cmd_task_show(args, registry):
+    """任务详情（契约 §15.2 / §18）：含 stdout/stderr 的人类可读多行输出。"""
+    device = resolve(registry, args.name, trust=_trust(args))
+    data = request(device, "GET", "/v1/task/%s" % args.task_id,
+                   timeout=30, trust=_trust(args))
+    if args.json:
+        dump(data)
+        return
+    cwd = data.get("cwd")
+    print("任务ID    : %s" % data.get("id"))
+    print("身份      : %s" % (data.get("identity") or "-"))
+    print("状态      : %s    退出码: %s    耗时: %ss" % (
+        data.get("status"), data.get("exit_code"), data.get("duration")))
+    print("命令      : %s（shell=%s%s）" % (
+        data.get("cmd"), data.get("shell"),
+        "" if not cwd else "  cwd=%s" % cwd))
+    print("开始      : %s    结束: %s" % (
+        _task_time(data.get("started_at")), _task_time(data.get("ended_at"))))
+    stdout_text = data.get("stdout") or ""
+    stderr_text = data.get("stderr") or ""
+    print("-- stdout " + "-" * 62)
+    if stdout_text:
+        sys.stdout.write(stdout_text if stdout_text.endswith("\n")
+                         else stdout_text + "\n")
+    print("-- stderr " + "-" * 62)
+    if stderr_text:
+        sys.stdout.write(stderr_text if stderr_text.endswith("\n")
+                         else stderr_text + "\n")
+
+
+def cmd_del(args, registry):
+    """删除远程文件（契约 §14.4 / §18）：缺 --yes 控制端本地拒绝，不发任何请求（D24）。"""
+    if not args.yes:
+        raise SystemExit("拒绝执行：删除远程文件必须显式加 --yes 确认（未发送任何请求）")
+    device = resolve(registry, args.name, trust=_trust(args))
+    result = request(device, "POST", "/v1/fs/delete",
+                     {"path": args.path, "confirm": True}, trust=_trust(args))
+    if args.json:
+        dump(result)
+        return
+    print("已删除 %s" % result.get("path", args.path))
+
+
+def cmd_mkdir(args, registry):
+    """创建远程目录（契约 §14.4 / §18）：递归创建，已存在视为成功。"""
+    device = resolve(registry, args.name, trust=_trust(args))
+    result = request(device, "POST", "/v1/fs/mkdir", {"path": args.path},
+                     trust=_trust(args))
+    if args.json:
+        dump(result)
+        return
+    print("已创建目录 %s" % result.get("path", args.path))
+
+
+def cmd_mv(args, registry):
+    """移动/重命名远程文件或目录（契约 §14.4 / §18）：src 与 dst 均须在白名单内。"""
+    device = resolve(registry, args.name, trust=_trust(args))
+    result = request(device, "POST", "/v1/fs/move",
+                     {"src": args.src, "dst": args.dst}, trust=_trust(args))
+    if args.json:
+        dump(result)
+        return
+    print("已移动 %s -> %s" % (args.src, result.get("dst", args.dst)))
+
+
+# --------------------------------------------------------------------------
 # 入口
 # --------------------------------------------------------------------------
 
@@ -727,7 +1192,8 @@ def build_parser():
     p = sub.add_parser("add", parents=[common], help="注册设备")
     p.add_argument("ip")
     p.add_argument("--name", default=None)
-    p.add_argument("--port", type=int, default=8788)
+    p.add_argument("--port", type=int, default=51888,
+                   help="端口（默认 51888，偏差 7）")
     p.add_argument("--token", required=True)
     p.add_argument("--identity", default="default", help="node 侧身份名（默认 default）")
     p.set_defaults(func=cmd_add)
@@ -807,18 +1273,23 @@ def build_parser():
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_cat)
 
-    p = sub.add_parser("put", parents=[common], help="上传文件")
+    p = sub.add_parser("put", parents=[common], help="上传文件（S2 流式分块，支持断点续传）")
     p.add_argument("name")
     p.add_argument("local")
     p.add_argument("remote")
+    p.add_argument("--fresh", action="store_true",
+                   help="终止服务端既有上传会话，丢弃断点全新上传")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_put)
 
-    p = sub.add_parser("get", parents=[common], help="下载文件")
+    p = sub.add_parser("get", parents=[common], help="下载文件（S2 流式分块，支持断点续传）")
     p.add_argument("name")
     p.add_argument("remote")
     p.add_argument("local")
-    p.add_argument("--max", type=int, default=64 * 1024 * 1024)
+    p.add_argument("--max", type=int, default=64 * 1024 * 1024,
+                   help="保留参数，S2 起不再使用（流式下载无上限，静默忽略）")
+    p.add_argument("--fresh", action="store_true",
+                   help="删除断点文件 <local>.crosspart，重新完整下载")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_get)
 
@@ -838,6 +1309,48 @@ def build_parser():
     p.add_argument("--out", default=None, help="export 输出文件（默认 audit_<设备>_<HHMMSS>.json）")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser("wheel", parents=[common], help="滚轮滚动（负值向上）")
+    p.add_argument("name")
+    p.add_argument("delta", type=int, help="滚动量，可为负")
+    p.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    p.set_defaults(func=cmd_wheel)
+
+    p = sub.add_parser("task", parents=[common], help="任务历史（S2 持久化）")
+    task_sub = p.add_subparsers(dest="task_action", required=True)
+    tp = task_sub.add_parser("ls", parents=[common], help="列出任务历史")
+    tp.add_argument("name")
+    tp.add_argument("--status", default=None,
+                    choices=["running", "done", "timeout", "failed"], help="按状态过滤")
+    tp.add_argument("--limit", type=int, default=None, help="返回条数（1-200，节点默认 50）")
+    tp.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    tp.set_defaults(func=cmd_task_list)
+    tp = task_sub.add_parser("show", parents=[common], help="查看任务详情（含 stdout/stderr）")
+    tp.add_argument("name")
+    tp.add_argument("task_id")
+    tp.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    tp.set_defaults(func=cmd_task_show)
+
+    p = sub.add_parser("del", parents=[common], help="删除远程文件（必须显式 --yes）")
+    p.add_argument("name")
+    p.add_argument("path")
+    p.add_argument("--yes", action="store_true",
+                   help="显式确认删除（D24：缺省本地拒绝，不发请求）")
+    p.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    p.set_defaults(func=cmd_del)
+
+    p = sub.add_parser("mkdir", parents=[common], help="创建远程目录（递归）")
+    p.add_argument("name")
+    p.add_argument("path")
+    p.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    p.set_defaults(func=cmd_mkdir)
+
+    p = sub.add_parser("mv", parents=[common], help="移动/重命名远程文件或目录")
+    p.add_argument("name")
+    p.add_argument("src")
+    p.add_argument("dst")
+    p.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    p.set_defaults(func=cmd_mv)
 
     return parser
 

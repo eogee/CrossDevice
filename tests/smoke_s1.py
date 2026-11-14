@@ -759,24 +759,28 @@ def main():
 
         ctx.cfg = tmp / "config" / "node.json"
         ctx.cfg_plain = tmp / "config_plain" / "node.json"
+        # S2 白名单适配（契约 §14.5 既定）：fs/write / put 受 workspace 约束，
+        # 测试配置补 workspace 键指向工作目录；A1–A8 断言不变。
+        ctx.work = tmp / "work"
+        ctx.work.mkdir(parents=True, exist_ok=True)
         tokens = [{"name": "default", "token": TOKEN_DEFAULT},
                   {"name": "tester", "token": TOKEN_TESTER}]
         write_json(ctx.cfg, {
             "version": 1, "tokens": tokens,
             "tls": {"cert": str(ctx.cert1), "key": str(ctx.key1)},
             "audit": {"retention_days": 180},
+            "workspace": [str(ctx.work)],
         })
         write_json(ctx.cfg_plain, {
             "version": 1, "tokens": tokens,
             "tls": {"cert": str(ctx.cert1), "key": str(ctx.key1)},
             "audit": {"retention_days": 180},
+            "workspace": [str(ctx.work)],
         })
 
         # xd 注册表打补丁到临时目录（绝不触碰仓库 data/）
         ctx.port_main = free_port()
         ctx.port_plain = free_port()
-        ctx.work = tmp / "work"
-        ctx.work.mkdir(parents=True, exist_ok=True)
         xd.REGISTRY = tmp / "registry" / "devices.json"
         xd.DATA = xd.REGISTRY.parent
         xd.save_registry({"devices": {}})

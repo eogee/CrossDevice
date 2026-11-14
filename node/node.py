@@ -8,28 +8,44 @@ CrossDevice 执行器（node）
 
 提供能力：
     /v1/health        健康检查
-    /v1/info          环境自检（交互会话 / 锁屏 / 提权 / DPI / 显示器）
-    /v1/exec          启动命令任务，返回 job_id
-    /v1/job/<id>      查询任务结果（支持 wait 长轮询）
+    /v1/info          环境自检（交互会话 / 锁屏 / 提权 / DPI / 显示器 / 地址）
+    /v1/exec          启动命令任务，返回 job_id（创建即写入任务历史）
+    /v1/job/<id>      查询任务结果（wait 长轮询；内存 miss 后查任务历史库）
     /v1/fs/list       列目录
     /v1/fs/read       读文件
-    /v1/fs/write      写文件
+    /v1/fs/write      写文件（S2 起受工作空间白名单约束）
     /v1/fs/stat       文件信息
+    /v1/fs/checksum   分块流式 MD5 校验和（S2 新增）
+    /v1/fs/download   流式下载，支持 Range 206（S2 新增）
+    /v1/fs/upload/*   上传三段式 begin/chunk/commit/abort，断点续传（S2 新增）
+    /v1/fs/delete     删除文件（白名单 + confirm 显式确认，S2 新增）
+    /v1/fs/mkdir      递归建目录（白名单，S2 新增）
+    /v1/fs/move       移动（src/dst 双白名单，S2 新增）
+    /v1/task/list     任务历史列表（一期仅本人可见，S2 新增）
+    /v1/task/<id>     任务详情（S2 新增）
     /v1/screen        截屏，返回 PNG
     /v1/input         鼠标键盘注入
     /v1/audit         审计日志查询（S1 新增）
     /v1/self-update   热更新自身源码并重启
 
-安全基线（S1，唯一行为依据 docs/接口契约.md V1.0）：
+安全基线（S1，唯一行为依据 docs/接口契约.md V1.2）：
     - 传输：默认 HTTPS（TLS 1.3，自签证书 + TOFU）；--debug-plaintext 才回退明文（D31）
     - 身份：node.json 多控制端身份（tokens 列表），令牌用 hmac.compare_digest 常量时间比较
     - 防重放：每个 /v1/* 请求必须带 X-Timestamp / X-Nonce，nonce 仅内存缓存（重启清空）
-    - 审计：<config 目录>/audit/audit-YYYYMMDD.jsonl 追加写，默认留存 180 天
+    - 审计：<config 目录>/audit/audit-YYYYMMDD.jsonl 追加写，默认留存 180 天；
+      业务 403（SANDBOX_DENIED 白名单越界）落审计且 target 照常（§8.2）
+    - 新端点一律过同一 guard 链：私网来源 → 身份 → 防重放 → 审计
+
+能力扩展（S2，契约 §13–§17）：
+    - 大文件流式：checksum / download（Range 206）/ 上传三段式，全程分块读写不整载
+    - 工作空间白名单：workspace 默认空 = 拒绝一切写/删/建目录/移动/上传（§14）
+    - 任务历史：sqlite 落库（tasks.db）、/v1/task/list 与详情、留存先到先清（§15）
+    - 端口与多实例：默认 51888、占用 +1 顺延并持久化、--instance 实例隔离（§16）
 
 启动方式：
-    python node.py [--port 8788] [--host 0.0.0.0] [--token <令牌>] [--verbose]
+    python node.py [--port 51888] [--host 0.0.0.0] [--token <令牌>] [--verbose]
                    [--config <node.json 路径>] [--cert <cert.pem> --key <key.pem>]
-                   [--debug-plaintext]
+                   [--workspace "<根1>,<根2>"] [--instance <名>] [--debug-plaintext]
 """
 
 import argparse
@@ -42,7 +58,9 @@ import math
 import os
 import platform
 import re
+import shutil
 import socket
+import sqlite3
 import ssl
 import struct
 import subprocess
@@ -57,9 +75,10 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-NODE_VERSION = "0.2.0"
+NODE_VERSION = "0.3.0"
 MAX_OUTPUT = 256 * 1024          # 单个任务输出上限
 MAX_BODY = 64 * 1024 * 1024      # 请求体上限
+DEFAULT_PORT = 51888             # S2 默认端口（D28/B20，偏差 7；契约 §16.1）
 VERBOSE = False
 STARTED_AT = time.time()
 
@@ -484,6 +503,8 @@ def collect_info():
             "fingerprint": CERT_FINGERPRINT,
         },
         "identity_count": len(IDENTITIES),
+        # S2 新增字段（契约 §6.2/§17.1）：本机私网 IPv4 列表
+        "addresses": local_addresses(),
     }
 
 
@@ -641,35 +662,41 @@ def _run_job(job_id, prompt, shell, cwd, timeout):
             proc.kill()
             out, err = proc.communicate()
             status = "timeout"
-        with JOBS_LOCK:
-            JOBS[job_id].update({
-                "status": status,
-                "exit_code": proc.returncode,
-                "stdout": _trim(_decode(out)),
-                "stderr": _trim(_decode(err)),
-                "duration": round(time.time() - started, 3),
-                "ended_at": time.time(),
-            })
+        result = {
+            "status": status,
+            "exit_code": proc.returncode,
+            "stdout": _trim(_decode(out)),
+            "stderr": _trim(_decode(err)),
+            "duration": round(time.time() - started, 3),
+            "ended_at": time.time(),
+        }
     except Exception as exc:
-        with JOBS_LOCK:
-            JOBS[job_id].update({
-                "status": "failed",
-                "exit_code": None,
-                "stdout": "",
-                "stderr": str(exc),
-                "duration": round(time.time() - started, 3),
-                "ended_at": time.time(),
-            })
+        result = {
+            "status": "failed",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": str(exc),
+            "duration": round(time.time() - started, 3),
+            "ended_at": time.time(),
+        }
+    with JOBS_LOCK:
+        JOBS[job_id].update(result)
+    # 任务线程结束落库终态（契约 §15.1；失败仅告警，不影响内存结果）
+    db_update_finished(job_id, result["status"], result["exit_code"],
+                       result["stdout"], result["stderr"],
+                       result["duration"], result["ended_at"])
 
 
-def start_job(prompt, shell="cmd", cwd=None, timeout=60):
+def start_job(prompt, shell="cmd", cwd=None, timeout=60, identity=""):
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[job_id] = {
-            "id": job_id, "status": "running", "cmd": prompt, "shell": shell,
-            "cwd": cwd, "started_at": time.time(), "ended_at": None,
+            "id": job_id, "identity": identity, "status": "running",
+            "cmd": prompt, "shell": shell, "cwd": cwd,
+            "started_at": time.time(), "ended_at": None,
             "exit_code": None, "stdout": "", "stderr": "", "duration": None,
         }
+    db_insert_running(JOBS[job_id])     # 创建即写入任务历史（契约 §15.1）
     threading.Thread(target=_run_job, args=(job_id, prompt, shell, cwd, timeout),
                      daemon=True).start()
     return job_id
@@ -679,6 +706,224 @@ def get_job(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         return dict(job) if job else None
+
+
+# --------------------------------------------------------------------------
+# 任务历史持久化（契约 §15 / §10 冻结 DDL）
+# --------------------------------------------------------------------------
+
+TASKS_DB_PATH = ""                  # <config 目录>/tasks[-<实例>].db（§15.1/§16.2）
+TASKS_CONN = None                   # 单连接 + 全局锁串行化（§15.1 允许的线程安全方式）
+TASKS_LOCK = threading.Lock()
+TASKS_RETENTION_DAYS = 30           # 留存天数默认（§15.4，D36）
+TASKS_MAX_ENTRIES = 100000          # 留存条数默认（§15.4，D36）
+
+TASKS_DDL = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id          TEXT PRIMARY KEY,           -- 12 hex，与内存 job id 同源
+    identity    TEXT NOT NULL DEFAULT '',   -- 发起身份名（S1 身份模型）
+    cmd         TEXT NOT NULL,
+    shell       TEXT NOT NULL DEFAULT 'cmd',
+    cwd         TEXT,
+    status      TEXT NOT NULL,              -- running / done / timeout / failed
+    exit_code   INTEGER,
+    stdout      TEXT,
+    stderr      TEXT,
+    started_at  REAL NOT NULL,
+    ended_at    REAL,
+    duration    REAL
+)
+"""
+
+
+class TaskAuthzError(Exception):
+    """任务列表 identity 参数越权（§15.2，D34 → 403 FORBIDDEN）。"""
+
+
+def tasks_db_init(path):
+    """初始化任务历史库（§15.1）：单连接 + 全局锁，多任务线程并发落库无损坏。"""
+    global TASKS_DB_PATH, TASKS_CONN
+    TASKS_DB_PATH = path
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute(TASKS_DDL)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_started_at ON jobs(started_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_identity ON jobs(identity)")
+    conn.commit()
+    TASKS_CONN = conn
+
+
+def db_insert_running(job):
+    """exec 创建任务即落库（§15.1）：status=running，identity=请求身份。失败仅告警。"""
+    with TASKS_LOCK:
+        try:
+            TASKS_CONN.execute(
+                "INSERT INTO jobs (id, identity, cmd, shell, cwd, status, exit_code,"
+                " stdout, stderr, started_at, ended_at, duration)"
+                " VALUES (?, ?, ?, ?, ?, 'running', NULL, '', '', ?, NULL, NULL)",
+                (job["id"], job.get("identity", ""), job["cmd"], job["shell"],
+                 job["cwd"], job["started_at"]))
+            TASKS_CONN.commit()
+        except sqlite3.Error as exc:
+            sys.stderr.write("[警告] 任务落库失败：%s（%s）\n" % (job["id"], exc))
+
+
+def db_update_finished(job_id, status, exit_code, stdout, stderr, duration, ended_at):
+    """任务线程结束时更新终态（§15.1）。失败仅告警。"""
+    with TASKS_LOCK:
+        try:
+            TASKS_CONN.execute(
+                "UPDATE jobs SET status=?, exit_code=?, stdout=?, stderr=?,"
+                " duration=?, ended_at=? WHERE id=?",
+                (status, exit_code, stdout, stderr, duration, ended_at, job_id))
+            TASKS_CONN.commit()
+        except sqlite3.Error as exc:
+            sys.stderr.write("[警告] 任务结果落库失败：%s（%s）\n" % (job_id, exc))
+
+
+def db_get_job(job_id):
+    """按 id 查任务全量行（§6.4：内存 miss 后查库，记录均为终态）。"""
+    with TASKS_LOCK:
+        try:
+            row = TASKS_CONN.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        except sqlite3.Error:
+            return None
+    return dict(row) if row else None
+
+
+def db_get_task_of(task_id, identity):
+    """本人任务详情（§15.2，D34）：不存在或非本人一律返回 None（对外 404）。"""
+    with TASKS_LOCK:
+        try:
+            row = TASKS_CONN.execute(
+                "SELECT * FROM jobs WHERE id = ? AND identity = ?",
+                (task_id, identity)).fetchone()
+        except sqlite3.Error:
+            return None
+    return dict(row) if row else None
+
+
+def db_recover_running():
+    """启动恢复（§15.3）：遗留 running 标 failed，stderr 追加中断说明并补齐时间。"""
+    now = time.time()
+    with TASKS_LOCK:
+        try:
+            rows = TASKS_CONN.execute(
+                "SELECT id, started_at FROM jobs WHERE status = 'running'").fetchall()
+            for row in rows:
+                TASKS_CONN.execute(
+                    "UPDATE jobs SET status = 'failed', exit_code = NULL,"
+                    " stderr = COALESCE(stderr, '') || ?,"
+                    " ended_at = ?, duration = ? WHERE id = ?",
+                    ("\n执行器重启，任务中断", now, now - row["started_at"], row["id"]))
+            TASKS_CONN.commit()
+            if rows:
+                sys.stderr.write("[信息] 已将 %d 个中断任务标记为 failed\n" % len(rows))
+        except sqlite3.Error as exc:
+            sys.stderr.write("[警告] 任务恢复失败：%s\n" % exc)
+
+
+def tasks_cleanup():
+    """留存清理（§15.4）：年龄与数量阈值先到先清；不影响审计日志（D36）。"""
+    with TASKS_LOCK:
+        try:
+            cutoff = time.time() - TASKS_RETENTION_DAYS * 86400
+            TASKS_CONN.execute("DELETE FROM jobs WHERE started_at < ?", (cutoff,))
+            total = TASKS_CONN.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            if total > TASKS_MAX_ENTRIES:
+                excess = total - TASKS_MAX_ENTRIES
+                TASKS_CONN.execute(
+                    "DELETE FROM jobs WHERE id IN"
+                    " (SELECT id FROM jobs ORDER BY started_at ASC LIMIT ?)",
+                    (excess,))
+            TASKS_CONN.commit()
+        except sqlite3.Error as exc:
+            sys.stderr.write("[警告] 任务历史清理失败：%s\n" % exc)
+
+
+def tasks_retention_loop():
+    """运行期每小时清理一次（§15.4）；顺带执行审计留存清理（S1 遗留 #5 收口：
+    审计原为仅启动期清理，现与任务清理同循环每小时执行，口径一致按文件名日期删超期）。"""
+    while True:
+        time.sleep(3600)
+        tasks_cleanup()
+        cleanup_audit_files()
+
+
+def load_tasks_config(cfg):
+    """加载留存配置（§15.4）：下限 1，非法值回退默认。"""
+    global TASKS_RETENTION_DAYS, TASKS_MAX_ENTRIES
+    tasks_cfg = cfg.get("tasks") if isinstance(cfg.get("tasks"), dict) else {}
+
+    def pick(value, default):
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    TASKS_RETENTION_DAYS = pick(tasks_cfg.get("retention_days", 30), 30)
+    TASKS_MAX_ENTRIES = pick(tasks_cfg.get("max_entries", 100000), 100000)
+
+
+def task_list(query, requester):
+    """实现 GET /v1/task/list（契约 §15.2）。identity 越权抛 TaskAuthzError。"""
+    ident = query.get("identity")
+    if ident is not None and ident != requester:
+        raise TaskAuthzError()          # 一期任务仅本人可见（D34）
+    status = query.get("status")
+    if status is not None and status not in ("running", "done", "timeout", "failed"):
+        raise ParamError("status 参数非法（running/done/timeout/failed）")
+    since = until = None
+    if "since" in query:
+        try:
+            since = float(query["since"])
+        except (TypeError, ValueError):
+            raise ParamError("since 参数必须是 Unix 时间戳（秒）")
+    if "until" in query:
+        try:
+            until = float(query["until"])
+        except (TypeError, ValueError):
+            raise ParamError("until 参数必须是 Unix 时间戳（秒）")
+    limit = 50
+    if "limit" in query:
+        try:
+            limit = int(query["limit"])
+        except (TypeError, ValueError):
+            raise ParamError("limit 参数必须是整数")
+        if not 1 <= limit <= 200:
+            raise ParamError("limit 参数超出范围（1–200）")
+    offset = 0
+    if "offset" in query:
+        try:
+            offset = int(query["offset"])
+        except (TypeError, ValueError):
+            raise ParamError("offset 参数必须是整数")
+        if offset < 0:
+            raise ParamError("offset 参数不能为负")
+
+    where = ["identity = ?"]
+    params = [requester]
+    if status is not None:
+        where.append("status = ?")
+        params.append(status)
+    if since is not None:
+        where.append("started_at >= ?")
+        params.append(since)
+    if until is not None:
+        where.append("started_at <= ?")
+        params.append(until)
+    cond = " AND ".join(where)
+    with TASKS_LOCK:
+        total = TASKS_CONN.execute(
+            "SELECT COUNT(*) FROM jobs WHERE " + cond, params).fetchone()[0]
+        rows = TASKS_CONN.execute(
+            "SELECT id, identity, cmd, shell, cwd, status, exit_code,"
+            " started_at, ended_at, duration FROM jobs WHERE " + cond
+            + " ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            params + [limit, offset]).fetchall()
+    # 摘要不含 stdout/stderr（§15.2）；entries 按 started_at 降序
+    return {"entries": [dict(row) for row in rows], "total": total}
 
 
 # --------------------------------------------------------------------------
@@ -751,13 +996,300 @@ def fs_stat(path):
 
 
 # --------------------------------------------------------------------------
+# 工作空间白名单（契约 §14）
+# --------------------------------------------------------------------------
+
+WORKSPACE_ROOTS = []                # 规范化后的白名单根列表（§14.1；默认空 = 拒绝一切写删）
+MAX_WORKSPACE_ROOTS = 16            # 白名单根数量上限（§14.1）
+
+
+def normalize_real(path):
+    """路径规范化（契约 §14.3）：realpath 解析符号链接 / .. 穿越 / 8.3 短名，
+    再 normcase 归一盘符与大小写。"""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def workspace_hit(path):
+    """工作空间白名单判定 helper（契约 §14.3，独立可调用，便于冒烟白盒测试）。
+
+    判定：请求路径与白名单根均做 realpath + normcase 规范化；
+    命中 = 等于根，或以 根 + os.sep 开头。
+
+    返回 (ok, reason, normalized)：
+        ok=True,  reason="ok"            通过（命中某个存在的白名单根）
+        ok=False, reason="denied"        未命中任何根 → 403 SANDBOX_DENIED
+        ok=False, reason="root_missing"  按前缀落入根但根目录不存在 → 400（不自动建根）
+    """
+    norm = normalize_real(path)
+    hit = [root for root in WORKSPACE_ROOTS
+           if norm == root or norm.startswith(root + os.sep)]
+    if not hit:
+        return False, "denied", norm
+    if any(os.path.isdir(root) for root in hit):
+        return True, "ok", norm
+    return False, "root_missing", norm
+
+
+def load_workspace(args, cfg):
+    """加载白名单根（契约 §14.1）：CLI --workspace（逗号分隔）覆盖配置文件 workspace。"""
+    global WORKSPACE_ROOTS
+    if args.workspace is not None:
+        raw = args.workspace.split(",")
+    else:
+        raw = cfg.get("workspace") if isinstance(cfg.get("workspace"), list) else []
+    roots = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            roots.append(item.strip())
+    if len(roots) > MAX_WORKSPACE_ROOTS:
+        sys.stderr.write("[警告] 工作空间根数量超过上限 %d，仅保留前 %d 个\n"
+                         % (MAX_WORKSPACE_ROOTS, MAX_WORKSPACE_ROOTS))
+        roots = roots[:MAX_WORKSPACE_ROOTS]
+    WORKSPACE_ROOTS = [normalize_real(root) for root in roots]
+
+
+# --------------------------------------------------------------------------
+# 大文件流式（契约 §13）：分块 MD5 / 上传三段式 / 孤儿清理
+# --------------------------------------------------------------------------
+
+UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024     # 上传分块大小（§13.3）
+UPLOAD_MAX_SESSIONS = 8                 # 活跃上传会话上限（§13.3）
+DOWNLOAD_BLOCK = 1024 * 1024            # 下载/checksum/commit 校验分块 ≤1MB（性能底线）
+UPLOAD_SESSIONS = {}                    # upload_id -> 会话字典（仅内存，不跨重启，§13.3）
+UPLOAD_LOCK = threading.Lock()          # 会话字典读写锁
+UPLOADS_MANIFEST = ""                   # 上传清单文件路径（§13.5，启动清理孤儿用）
+UPLOADS_MANIFEST_LOCK = threading.Lock()
+
+
+class UploadError(Exception):
+    """上传阶段业务错误（§13.3）：code 为错误码，status 为对应 HTTP 状态码。"""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.status = 404 if code == "NOT_FOUND" else 400
+
+
+def md5_file(path, block_size=DOWNLOAD_BLOCK):
+    """分块流式计算文件 MD5（1MB 块，不整载；§13.1/§13.2/§13.3）。"""
+    digest = hashlib.md5()
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(block_size)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_uploads_manifest():
+    try:
+        with open(UPLOADS_MANIFEST, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def uploads_manifest_add(temp_path):
+    """begin 登记：把临时文件路径写入上传清单（原子写，§13.5）。"""
+    with UPLOADS_MANIFEST_LOCK:
+        items = _read_uploads_manifest()
+        if temp_path in items:
+            return
+        items.append(temp_path)
+        try:
+            atomic_write_json(UPLOADS_MANIFEST, items)
+        except OSError as exc:
+            sys.stderr.write("[警告] 上传清单登记失败：%s\n" % exc)
+
+
+def uploads_manifest_remove(temp_path):
+    """commit / abort 移除登记（原子写，§13.5）。"""
+    with UPLOADS_MANIFEST_LOCK:
+        items = _read_uploads_manifest()
+        if temp_path not in items:
+            return
+        items.remove(temp_path)
+        try:
+            atomic_write_json(UPLOADS_MANIFEST, items)
+        except OSError as exc:
+            sys.stderr.write("[警告] 上传清单移除失败：%s\n" % exc)
+
+
+def cleanup_upload_orphans():
+    """node 启动时清理上次进程遗留的上传临时文件并清空清单（契约 §13.5）。"""
+    items = _read_uploads_manifest()
+    removed = 0
+    for item in items:
+        if not isinstance(item, str) or not item:
+            continue
+        if os.path.exists(item):
+            try:
+                os.remove(item)
+                removed += 1
+            except OSError as exc:
+                sys.stderr.write("[警告] 上传临时文件清理失败：%s（%s）\n" % (item, exc))
+    if os.path.exists(UPLOADS_MANIFEST):
+        try:
+            atomic_write_json(UPLOADS_MANIFEST, [])
+        except OSError as exc:
+            sys.stderr.write("[警告] 上传清单清空失败：%s\n" % exc)
+    if removed and VERBOSE:
+        sys.stderr.write("[信息] 已清理 %d 个遗留上传临时文件\n" % removed)
+
+
+def _cleanup_session_files(sess):
+    """删除会话临时文件并移除清单登记（内存移除由调用方完成）。"""
+    try:
+        os.remove(sess["temp"])
+    except OSError:
+        pass
+    uploads_manifest_remove(sess["temp"])
+
+
+def _discard_session(sess):
+    """终止会话：移出内存 + 删临时文件 + 移除清单（调用方需持有 UPLOAD_LOCK）。"""
+    UPLOAD_SESSIONS.pop(sess["upload_id"], None)
+    _cleanup_session_files(sess)
+
+
+def _truncate_to(path, size):
+    """把文件截断到指定长度（chunk 写失败回滚用，保证续传偏移与磁盘一致）。"""
+    try:
+        with open(path, "r+b") as fh:
+            fh.truncate(size)
+    except OSError:
+        pass
+
+
+def upload_begin(target, size, md5_digest):
+    """begin 阶段（契约 §13.3）。白名单由调用方先行校验；返回响应 data。"""
+    abs_target = os.path.abspath(target)
+    norm = normalize_real(abs_target)
+    parent = os.path.dirname(abs_target)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            raise UploadError("BAD_REQUEST", "无法创建上传目标目录：%s" % exc)
+    with UPLOAD_LOCK:
+        old = None
+        for sess in UPLOAD_SESSIONS.values():
+            if sess["norm"] == norm:
+                old = sess
+                break
+        if old is not None:
+            if old["size"] == size and old["md5"] == md5_digest:
+                # 同目标且 size/md5 均一致：复用会话（断点续传，§13.3）
+                return {"upload_id": old["upload_id"],
+                        "chunk_size": UPLOAD_CHUNK_SIZE,
+                        "resume_offset": old["received"]}
+            _discard_session(old)       # size 或 md5 不一致：终止旧会话后重建
+        if len(UPLOAD_SESSIONS) >= UPLOAD_MAX_SESSIONS:
+            raise UploadError("BAD_REQUEST",
+                              "上传会话已达上限 %d，请先 commit 或 abort"
+                              % UPLOAD_MAX_SESSIONS)
+        upload_id = uuid.uuid4().hex[:16]
+        temp = abs_target + ".crosspart-" + upload_id
+        try:
+            with open(temp, "ab"):      # 预创建临时文件占位（顺带验证目录可写）
+                pass
+        except OSError as exc:
+            raise UploadError("BAD_REQUEST", "无法创建上传临时文件：%s" % exc)
+        UPLOAD_SESSIONS[upload_id] = {
+            "upload_id": upload_id, "path": abs_target, "norm": norm,
+            "size": size, "md5": md5_digest, "received": 0, "temp": temp,
+        }
+    uploads_manifest_add(temp)
+    return {"upload_id": upload_id, "chunk_size": UPLOAD_CHUNK_SIZE,
+            "resume_offset": 0}
+
+
+def upload_chunk(upload_id, offset, data):
+    """chunk 阶段（契约 §13.3）：校验通过后按 offset 追加写入临时文件。"""
+    with UPLOAD_LOCK:
+        sess = UPLOAD_SESSIONS.get(upload_id)
+        if sess is None:
+            raise UploadError("NOT_FOUND", "上传会话不存在或已结束：%s" % upload_id)
+        if offset != sess["received"]:
+            raise UploadError("BAD_REQUEST",
+                              "offset 与会话当前偏移不符：会话当前偏移为 %d"
+                              % sess["received"])
+        if len(data) > UPLOAD_CHUNK_SIZE:
+            raise UploadError("BAD_REQUEST",
+                              "分块数据超过 chunk_size（%d 字节）" % UPLOAD_CHUNK_SIZE)
+        if sess["received"] + len(data) > sess["size"]:
+            raise UploadError("BAD_REQUEST", "累计字节将超过声明 size（%d）" % sess["size"])
+        try:
+            with open(sess["temp"], "ab") as fh:
+                fh.write(data)
+        except OSError:
+            _truncate_to(sess["temp"], sess["received"])   # 回滚部分写入
+            raise
+        sess["received"] += len(data)
+        return {"received": sess["received"], "next_offset": sess["received"]}
+
+
+def upload_commit(upload_id):
+    """commit 阶段（契约 §13.3）：流式 MD5 校验，失败清理会话与临时文件；
+    成功 os.replace 落盘并移除清单登记。"""
+    with UPLOAD_LOCK:
+        sess = UPLOAD_SESSIONS.pop(upload_id, None)
+    if sess is None:
+        raise UploadError("NOT_FOUND", "上传会话不存在或已结束：%s" % upload_id)
+    if sess["received"] != sess["size"]:
+        raise UploadError("BAD_REQUEST",
+                          "分块未收全：已收 %d/%d，可重新 begin 查询 resume_offset"
+                          % (sess["received"], sess["size"]))
+    try:
+        actual = md5_file(sess["temp"])     # 1MB 分块流式校验，不整载
+    except OSError as exc:
+        _cleanup_session_files(sess)
+        raise UploadError("BAD_REQUEST", "临时文件读取失败：%s" % exc)
+    if actual != sess["md5"]:
+        _cleanup_session_files(sess)        # MD5 不一致：清理会话与临时文件（§13.3）
+        raise UploadError("BAD_REQUEST",
+                          "MD5 校验失败：声明 %s，实际 %s（会话与临时文件已清理）"
+                          % (sess["md5"], actual))
+    # 覆盖已存在目标时，Windows 实时扫描可能瞬时占用目标文件导致 WinError 5：
+    # 与 xd 侧原子写同款短重试（10 次 × 0.1s），仍失败才清理会话并报 400
+    last_exc = None
+    for _ in range(10):
+        try:
+            os.replace(sess["temp"], sess["path"])   # 目标已存在则覆盖（§13.3）
+            last_exc = None
+            break
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(0.1)
+    if last_exc is not None:
+        _cleanup_session_files(sess)
+        raise UploadError("BAD_REQUEST", "落盘失败：%s" % last_exc)
+    uploads_manifest_remove(sess["temp"])
+    return {"path": sess["path"], "size": sess["size"], "md5": sess["md5"]}
+
+
+def upload_abort(upload_id):
+    """abort 阶段（契约 §13.3）：删除临时文件与清单登记。"""
+    with UPLOAD_LOCK:
+        sess = UPLOAD_SESSIONS.pop(upload_id, None)
+    if sess is None:
+        raise UploadError("NOT_FOUND", "上传会话不存在或已结束：%s" % upload_id)
+    _cleanup_session_files(sess)
+    return {"aborted": True}
+
+
+# --------------------------------------------------------------------------
 # 自更新
 # --------------------------------------------------------------------------
 
 def schedule_restart(delay=2):
     script = os.path.abspath(__file__)
     bat = os.path.join(tempfile.gettempdir(), "xd-node-restart.bat")
-    args = " ".join('"%s"' % a for a in sys.argv[1:])
+    # 参数逐个加引号透传（S2 新增 --workspace/--instance 值可含空格/逗号）；
+    # bat 文件中 % 是变量展开前缀，须转义为 %% 才能原样传给新进程
+    args = " ".join('"%s"' % a for a in sys.argv[1:]).replace("%", "%%")
     content = (
         "@echo off\r\n"
         'cd /d "%s"\r\n'
@@ -795,6 +1327,10 @@ def self_update(source):
 def default_config_path():
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(base, "CrossDevice", "node.json")
+
+
+def default_config_dir():
+    return os.path.dirname(default_config_path())
 
 
 def atomic_write_json(path, data):
@@ -840,15 +1376,16 @@ def normalize_identities(raw):
     return identities
 
 
-def load_config(args):
+def load_config(args, config_path=None):
     """加载 / 迁移 node.json（契约 §9.1），返回 (cfg, identities, 配置文件路径)。
 
     - 旧格式 {"token": X} 首次运行自动迁移为 tokens=[{"name":"default","token":X}]
       并原子写回；未知键（如 port）原样保留。
     - --token 覆盖 default 身份令牌，其余身份保留，结果写回配置。
     - 无任何令牌且未传 --token：生成 32 hex 新令牌作为 default。
+    - config_path：显式配置路径（--instance 时为 <config 目录>/node-<名>.json，§16.2）。
     """
-    path = args.config or default_config_path()
+    path = config_path or args.config or default_config_path()
     cfg = {}
     if os.path.exists(path):
         try:
@@ -973,13 +1510,31 @@ def cert_fingerprint_sha256(cert_path):
 class NodeHTTPServer(ThreadingHTTPServer):
     """带可选 TLS 的多线程 HTTP 服务。
 
+    绑定语义（契约 §16.1 的端口占用检测依赖 bind 失败的可靠性）：
+    - Windows 上 SO_REUSEADDR 允许两个套接字静默共绑同一端口（实测 case：
+      先到者与后到者均设 REUSE 时后到者 bind 成功），会让"端口被占用"判定失效，
+      因此默认禁用 SO_REUSEADDR，改设 SO_EXCLUSIVEADDRUSE 独占绑定；
+    - allow_reuse=True 仅在调用方探测到端口无活监听者、仅剩 TIME_WAIT 残留时
+      使用（回退 SO_REUSEADDR 绑定同端口），避免热重启后端口无谓顺延。
+
     TLS 模式下在 accept 阶段完成握手：明文请求打到 TLS 端口产生的握手
     异常在这里捕获（verbose 记日志、关闭连接、继续服务），不使服务崩溃。
     """
 
-    def __init__(self, address, handler, ssl_context=None):
+    allow_reuse_address = False         # 默认不用 SO_REUSEADDR（见类注释）
+
+    def __init__(self, address, handler, ssl_context=None, allow_reuse=False):
+        self._allow_reuse = allow_reuse
         super().__init__(address, handler)
         self.ssl_context = ssl_context
+
+    def server_bind(self):
+        if os.name == "nt" and not self._allow_reuse:
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass                    # 极老系统不支持时保持默认语义
+        super().server_bind()
 
     def get_request(self):
         sock, addr = self.socket.accept()
@@ -1035,9 +1590,10 @@ def sanitize_secret(text):
     return _TOKEN_IN_TEXT.sub(lambda m: m.group(1) + "token=***", text)
 
 
-def set_audit_paths(base_dir, retention_days):
+def set_audit_paths(audit_dir, retention_days):
+    """设置审计目录（§8.1；--instance 时为 audit-<名>/，实例隔离见 §16.2）。"""
     global AUDIT_DIR, AUDIT_RETENTION_DAYS
-    AUDIT_DIR = os.path.join(base_dir, "audit")
+    AUDIT_DIR = audit_dir
     try:
         retention_days = int(retention_days)
     except (TypeError, ValueError):
@@ -1227,9 +1783,15 @@ def is_private(ip):
 
 KNOWN_GET_PATHS = frozenset({
     "/", "/v1/health", "/v1/info", "/v1/fs/list", "/v1/fs/read",
-    "/v1/fs/stat", "/v1/screen", "/v1/audit",
+    "/v1/fs/stat", "/v1/fs/checksum", "/v1/fs/download",
+    "/v1/screen", "/v1/audit", "/v1/task/list",
 })
-KNOWN_POST_PATHS = frozenset({"/v1/exec", "/v1/input", "/v1/fs/write", "/v1/self-update"})
+KNOWN_POST_PATHS = frozenset({
+    "/v1/exec", "/v1/input", "/v1/fs/write", "/v1/self-update",
+    "/v1/fs/delete", "/v1/fs/mkdir", "/v1/fs/move",
+    "/v1/fs/upload/begin", "/v1/fs/upload/chunk",
+    "/v1/fs/upload/commit", "/v1/fs/upload/abort",
+})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1240,6 +1802,7 @@ class Handler(BaseHTTPRequestHandler):
     _resp_status = None
     _resp_code = None
     _audit_target = ""
+    _identity = ""                      # 本请求身份名（guard 通过后写入）
 
     def log_message(self, fmt, *args):
         if VERBOSE:
@@ -1275,14 +1838,31 @@ class Handler(BaseHTTPRequestHandler):
         """设置本请求的审计目标摘要（§8.3）。"""
         self._audit_target = text
 
+    def require_workspace(self, raw_path):
+        """写方向白名单校验（契约 §14.2/§14.3）。通过返回 True；失败已发送响应。
+
+        SANDBOX_DENIED 属业务 403：审计 target 由调用方先行设置，照常落审计（§8.2）。
+        约束范围：fs/write、fs/delete、fs/mkdir、fs/move（src+dst）、upload/begin。
+        """
+        ok, reason, _norm = workspace_hit(raw_path)
+        if ok:
+            return True
+        if reason == "root_missing":
+            self.fail("BAD_REQUEST", "工作空间根目录不存在：%s" % raw_path, 400)
+        else:
+            self.fail("SANDBOX_DENIED", "路径超出工作空间白名单：%s" % raw_path, 403)
+        return False
+
     def _is_known_path(self, path):
         return (path in KNOWN_GET_PATHS or path in KNOWN_POST_PATHS
-                or path.startswith("/v1/job/"))
+                or path.startswith("/v1/job/") or path.startswith("/v1/task/"))
 
     def audit(self, parsed, identity, result, code):
         """写一条审计（§8）。调用方保证已通过来源校验。"""
-        if result in (400, 401, 403, 409):
-            target = ""                       # 校验失败：目标摘要为空（§8.3）
+        # §8.2：校验失败（401/409/400，含业务 400 与来源 403）target 置空；
+        # 唯一例外是业务 403（SANDBOX_DENIED 白名单越界）——target 照常记录（可追溯）
+        if result in (400, 401, 409) or (result == 403 and code != "SANDBOX_DENIED"):
+            target = ""
         else:
             target = sanitize_secret(self._audit_target)
         if self._is_known_path(parsed.path):
@@ -1343,10 +1923,12 @@ class Handler(BaseHTTPRequestHandler):
         self._resp_status = None
         self._resp_code = None
         self._audit_target = ""
+        self._identity = ""
         parsed = urlparse(self.path)
         identity = self.guard(parsed)
         if identity is None:
             return
+        self._identity = identity
         try:
             router(parsed)
         except Exception as exc:
@@ -1405,17 +1987,50 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/v1/job/"):
             job_id = path.rsplit("/", 1)[-1]
-            wait = min(float(query.get("wait", 0)), 120.0)
+            try:
+                wait = min(float(query.get("wait", 0)), 120.0)
+            except (TypeError, ValueError):
+                self.fail("BAD_REQUEST", "wait 参数必须是数字（秒）", 400)
+                return
             deadline = time.time() + wait
             while True:
                 job = get_job(job_id)
-                if job is None:
-                    self.fail("NOT_FOUND", "任务不存在：%s" % job_id, 404)
+                if job is not None:
+                    # 长轮询仅对内存任务生效（库中记录均为终态，§6.4）
+                    if job["status"] != "running" or time.time() >= deadline:
+                        self.ok(job)
+                        return
+                    time.sleep(0.15)
+                    continue
+                # 内存 miss → 查任务历史库（§6.4/S2）；均无 → 404
+                row = db_get_job(job_id)
+                if row is not None:
+                    self.ok(row)
                     return
-                if job["status"] != "running" or time.time() >= deadline:
-                    self.ok(job)
-                    return
-                time.sleep(0.15)
+                self.fail("NOT_FOUND", "任务不存在：%s" % job_id, 404)
+                return
+
+        if path == "/v1/task/list":
+            # S2 新增（契约 §15.2）：任务历史列表，一期仅本人可见（D34）
+            self.set_target("filter=" + sanitize_secret(parsed.query))
+            try:
+                self.ok(task_list(query, self._identity))
+            except TaskAuthzError:
+                self.fail("FORBIDDEN", "任务列表仅限查询本人任务（identity 参数越权）", 403)
+            except ParamError as exc:
+                self.fail("BAD_REQUEST", str(exc), 400)
+            return
+
+        if path.startswith("/v1/task/"):
+            # S2 新增（契约 §15.2）：任务详情（含 stdout/stderr）
+            # 不存在或 identity ≠ 请求者一律 404（不泄露他人任务存在性，D34）；target 恒空（§8.3）
+            task_id = path[len("/v1/task/"):]
+            row = db_get_task_of(task_id, self._identity)
+            if row is None:
+                self.fail("NOT_FOUND", "任务不存在：%s" % task_id, 404)
+                return
+            self.ok(row)
+            return
 
         if path == "/v1/fs/list":
             list_path = query.get("path", ".")
@@ -1434,6 +2049,29 @@ class Handler(BaseHTTPRequestHandler):
             stat_path = query["path"]
             self.set_target("path=" + stat_path)
             self.ok(fs_stat(stat_path))
+            return
+
+        if path == "/v1/fs/checksum":
+            # S2 新增（契约 §13.1）：分块流式 MD5，不整载
+            ck_path = query.get("path")
+            self.set_target("path=" + (ck_path or ""))
+            if not ck_path:
+                self.fail("BAD_REQUEST", "缺少 path 参数", 400)
+                return
+            if not os.path.exists(ck_path):
+                self.fail("NOT_FOUND", "文件不存在：%s" % ck_path, 404)
+                return
+            if os.path.isdir(ck_path):
+                self.fail("BAD_REQUEST", "目标是目录，仅支持文件：%s" % ck_path, 400)
+                return
+            self.ok({"path": os.path.abspath(ck_path),
+                     "size": os.path.getsize(ck_path),
+                     "md5": md5_file(ck_path)})
+            return
+
+        if path == "/v1/fs/download":
+            # S2 新增（契约 §13.2）：原始字节响应 + Range 206
+            self.handle_fs_download(query)
             return
 
         if path == "/v1/screen":
@@ -1456,6 +2094,76 @@ class Handler(BaseHTTPRequestHandler):
 
         self.fail("NOT_FOUND", "未知接口：%s" % path, 404)
 
+    def handle_fs_download(self, query):
+        """实现 GET /v1/fs/download（契约 §13.2）。
+
+        无 Range → 200 全量流式；Range: bytes=start-end → 206 + Content-Range
+        （end≥size 截断为 size-1；start≥size / start>end / 非法格式 / 后缀与多区间 → 400）。
+        响应头恒带 X-File-Size / X-File-MD5 / application/octet-stream；
+        响应体为原始字节，按 1MB 缓冲循环发送，Content-Length 恒准确（keep-alive 依赖）。
+        """
+        dl_path = query.get("path")
+        range_header = self.headers.get("Range")
+        if not dl_path:
+            self.fail("BAD_REQUEST", "缺少 path 参数", 400)
+            return
+        self.set_target("path=%s range=full" % dl_path)   # §8.3（后续按实际区间覆盖）
+        if not os.path.exists(dl_path):
+            self.fail("NOT_FOUND", "文件不存在：%s" % dl_path, 404)
+            return
+        if os.path.isdir(dl_path):
+            self.fail("BAD_REQUEST", "目标是目录，仅支持文件：%s" % dl_path, 400)
+            return
+        size = os.path.getsize(dl_path)
+        digest = md5_file(dl_path)              # X-File-MD5：全文件 MD5（1MB 分块）
+        start, end = 0, size - 1
+        range_text = "full"
+        is_partial = False
+        if range_header:
+            # 仅支持 bytes=start-end 闭区间单区间形式（§13.2）
+            m = re.fullmatch(r"\s*bytes=(\d+)-(\d+)\s*", range_header)
+            if not m:
+                self.fail("BAD_REQUEST",
+                          "Range 头格式不支持（仅支持 bytes=start-end 单区间）", 400)
+                return
+            start, end = int(m.group(1)), int(m.group(2))
+            if start >= size:
+                self.fail("BAD_REQUEST",
+                          "Range 起始位置超出文件大小（size=%d）" % size, 400)
+                return
+            if start > end:
+                self.fail("BAD_REQUEST", "Range 起始位置大于结束位置", 400)
+                return
+            if end >= size:
+                end = size - 1                  # 标准 HTTP 语义：截断到末尾
+            is_partial = True
+            range_text = "%d-%d" % (start, end)
+        self.set_target("path=%s range=%s" % (dl_path, range_text))   # §8.3
+        length = end - start + 1
+        status = 206 if is_partial else 200
+        self._resp_status = status
+        self._resp_code = None
+        self.send_response(status)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(length))
+        self.send_header("X-File-Size", str(size))
+        self.send_header("X-File-MD5", digest)
+        if is_partial:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        try:
+            with open(dl_path, "rb") as fh:
+                fh.seek(start)
+                remaining = length
+                while remaining > 0:
+                    block = fh.read(min(DOWNLOAD_BLOCK, remaining))
+                    if not block:
+                        break                   # 文件被并发截断的防御
+                    self.wfile.write(block)
+                    remaining -= len(block)
+        except OSError:
+            self.close_connection = True        # 客户端中断，放弃剩余字节
+
     def route_post(self, parsed):
         path = parsed.path
 
@@ -1476,6 +2184,7 @@ class Handler(BaseHTTPRequestHandler):
                 shell=body.get("shell", "cmd"),
                 cwd=body.get("cwd"),
                 timeout=float(body.get("timeout", 60)),
+                identity=self._identity,        # 任务历史记录发起身份（§15.1）
             )
             self.ok({"job_id": job_id})
             return
@@ -1517,14 +2226,190 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/fs/write":
             body = self.read_body()
             write_path = body.get("path")
-            if write_path is not None:
-                if body.get("data_b64") is not None:
+            if not isinstance(write_path, str) or not write_path:
+                self.fail("BAD_REQUEST", "缺少 path", 400)
+                return
+            if body.get("data_b64") is not None:
+                try:
                     payload_len = len(base64.b64decode(body["data_b64"]))
-                else:
-                    payload_len = len((body.get("text") or "").encode("utf-8"))
-                self.set_target("path=%s bytes=%d" % (write_path, payload_len))
-            self.ok(fs_write(body["path"], body.get("text"),
-                             body.get("data_b64"), bool(body.get("append"))))
+                except Exception:
+                    self.fail("BAD_REQUEST", "data_b64 解码失败", 400)
+                    return
+            else:
+                payload_len = len((body.get("text") or "").encode("utf-8"))
+            self.set_target("path=%s bytes=%d" % (write_path, payload_len))
+            if not self.require_workspace(write_path):   # S2 起受白名单约束（§14.2）
+                return
+            try:
+                self.ok(fs_write(write_path, body.get("text"),
+                                 body.get("data_b64"), bool(body.get("append"))))
+            except OSError as exc:
+                self.fail("BAD_REQUEST", "写入失败：%s" % exc, 400)
+            return
+
+        if path == "/v1/fs/delete":
+            # S2 新增（契约 §14.4）：仅文件、需 confirm 显式确认（D24）
+            body = self.read_body()
+            del_path = body.get("path")
+            self.set_target("path=%s"
+                            % (del_path if isinstance(del_path, str) else ""))
+            if not isinstance(del_path, str) or not del_path:
+                self.fail("BAD_REQUEST", "缺少 path", 400)
+                return
+            if not self.require_workspace(del_path):
+                return
+            if body.get("confirm") is not True:
+                self.fail("BAD_REQUEST", "删除需显式确认：confirm 必须为 true", 400)
+                return
+            if not os.path.exists(del_path):
+                self.fail("NOT_FOUND", "文件不存在：%s" % del_path, 404)
+                return
+            if os.path.isdir(del_path):
+                self.fail("BAD_REQUEST", "仅支持删除文件，不支持目录：%s" % del_path, 400)
+                return
+            try:
+                os.remove(del_path)
+            except OSError as exc:
+                self.fail("BAD_REQUEST", "删除失败：%s" % exc, 400)
+                return
+            self.ok({"path": os.path.abspath(del_path), "deleted": True})
+            return
+
+        if path == "/v1/fs/mkdir":
+            # S2 新增（契约 §14.4）：递归创建，已存在视为成功
+            body = self.read_body()
+            mkdir_path = body.get("path")
+            self.set_target("path=%s"
+                            % (mkdir_path if isinstance(mkdir_path, str) else ""))
+            if not isinstance(mkdir_path, str) or not mkdir_path:
+                self.fail("BAD_REQUEST", "缺少 path", 400)
+                return
+            if not self.require_workspace(mkdir_path):
+                return
+            try:
+                os.makedirs(mkdir_path, exist_ok=True)
+            except OSError as exc:
+                self.fail("BAD_REQUEST", "创建目录失败：%s" % exc, 400)
+                return
+            self.ok({"path": os.path.abspath(mkdir_path), "created": True})
+            return
+
+        if path == "/v1/fs/move":
+            # S2 新增（契约 §14.4）：src 与 dst 均须在白名单内（§14.2）
+            body = self.read_body()
+            mv_src = body.get("src")
+            mv_dst = body.get("dst")
+            self.set_target("src=%s dst=%s" % (
+                mv_src if isinstance(mv_src, str) else "",
+                mv_dst if isinstance(mv_dst, str) else ""))
+            if (not isinstance(mv_src, str) or not mv_src
+                    or not isinstance(mv_dst, str) or not mv_dst):
+                self.fail("BAD_REQUEST", "缺少 src 或 dst", 400)
+                return
+            if not self.require_workspace(mv_src):
+                return
+            if not self.require_workspace(mv_dst):
+                return
+            if not os.path.exists(mv_src):
+                self.fail("NOT_FOUND", "源不存在：%s" % mv_src, 404)
+                return
+            if os.path.exists(mv_dst):
+                self.fail("BAD_REQUEST", "目标已存在：%s" % mv_dst, 400)
+                return
+            try:
+                try:
+                    os.replace(mv_src, mv_dst)       # 同卷（文件与目录均可）
+                except OSError:
+                    shutil.move(mv_src, mv_dst)      # 跨卷：复制 + 删除
+            except OSError as exc:
+                self.fail("BAD_REQUEST", "移动失败：%s" % exc, 400)
+                return
+            self.ok({"src": os.path.abspath(mv_src),
+                     "dst": os.path.abspath(mv_dst), "moved": True})
+            return
+
+        if path == "/v1/fs/upload/begin":
+            # S2 新增（契约 §13.3）：上传三段式之 begin，白名单在此校验
+            body = self.read_body()
+            up_path = body.get("path")
+            up_size = body.get("size")
+            up_md5 = body.get("md5")
+            if not isinstance(up_path, str) or not up_path:
+                self.fail("BAD_REQUEST", "缺少 path", 400)
+                return
+            if (not isinstance(up_size, int) or isinstance(up_size, bool)
+                    or up_size < 0):
+                self.fail("BAD_REQUEST", "size 必须是 ≥0 的整数", 400)
+                return
+            if not isinstance(up_md5, str) or not re.fullmatch(r"[0-9a-f]{32}", up_md5):
+                self.fail("BAD_REQUEST", "md5 必须是 32 位小写十六进制", 400)
+                return
+            self.set_target("path=%s size=%d" % (up_path, up_size))   # §8.3
+            if not self.require_workspace(up_path):
+                return
+            try:
+                self.ok(upload_begin(up_path, up_size, up_md5))
+            except UploadError as exc:
+                self.fail(exc.code, str(exc), exc.status)
+            return
+
+        if path == "/v1/fs/upload/chunk":
+            # S2 新增（契约 §13.3）：上传三段式之 chunk，只引用 upload_id（begin 已校验白名单）
+            body = self.read_body()
+            upload_id = body.get("upload_id")
+            offset = body.get("offset")
+            data_b64 = body.get("data_b64")
+            if not isinstance(upload_id, str) or not upload_id:
+                self.fail("BAD_REQUEST", "缺少 upload_id", 400)
+                return
+            self.set_target("upload=%s offset=%s" % (upload_id, offset))   # §8.3
+            if (not isinstance(offset, int) or isinstance(offset, bool)
+                    or offset < 0):
+                self.fail("BAD_REQUEST", "offset 必须是 ≥0 的整数", 400)
+                return
+            if not isinstance(data_b64, str):
+                self.fail("BAD_REQUEST", "缺少 data_b64", 400)
+                return
+            try:
+                data = base64.b64decode(data_b64, validate=True)
+            except Exception:
+                self.fail("BAD_REQUEST", "data_b64 解码失败", 400)
+                return
+            try:
+                self.ok(upload_chunk(upload_id, offset, data))
+            except UploadError as exc:
+                self.fail(exc.code, str(exc), exc.status)
+            return
+
+        if path == "/v1/fs/upload/commit":
+            # S2 新增（契约 §13.3）：上传三段式之 commit，MD5 校验失败清理会话与临时文件
+            body = self.read_body()
+            upload_id = body.get("upload_id")
+            if not isinstance(upload_id, str) or not upload_id:
+                self.fail("BAD_REQUEST", "缺少 upload_id", 400)
+                return
+            self.set_target("upload=%s" % upload_id)   # §8.3
+            try:
+                result = upload_commit(upload_id)
+            except UploadError as exc:
+                self.fail(exc.code, str(exc), exc.status)
+                return
+            self.set_target("upload=%s size=%d" % (upload_id, result["size"]))
+            self.ok(result)
+            return
+
+        if path == "/v1/fs/upload/abort":
+            # S2 新增（契约 §13.3）：上传三段式之 abort
+            body = self.read_body()
+            upload_id = body.get("upload_id")
+            if not isinstance(upload_id, str) or not upload_id:
+                self.fail("BAD_REQUEST", "缺少 upload_id", 400)
+                return
+            self.set_target("upload=%s" % upload_id)   # §8.3
+            try:
+                self.ok(upload_abort(upload_id))
+            except UploadError as exc:
+                self.fail(exc.code, str(exc), exc.status)
             return
 
         if path == "/v1/self-update":
@@ -1569,35 +2454,126 @@ def local_addresses():
     return [ip for ip in found if is_private(ip)]
 
 
+def _port_has_listener(host, port):
+    """探测端口是否已有活监听者（区分真占用与 TIME_WAIT 残留，§16.1 配套）。
+
+    超时取 0.15 秒：回环上活监听者毫秒级应答；对 bind 未 listen 的端口 Windows
+    会静默丢 SYN 直到超时——超时过长会拖慢顺延节奏（集成期实测问题，已修）。
+    """
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "", "*") else host
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.15)
+    try:
+        sock.connect((probe_host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _bind_attempt(host, port, ssl_context):
+    """单次端口绑定尝试（契约 §16.1 配套）。
+
+    先以 SO_EXCLUSIVEADDRUSE 独占绑定（NodeHTTPServer 默认）；失败且探测到端口
+    并无活监听者（仅 TIME_WAIT 残留）时，回退 SO_REUSEADDR 绑定同一端口，
+    避免热重启后端口无谓顺延。成功返回服务器实例；不可用返回 None。
+    """
+    try:
+        return NodeHTTPServer((host, port), Handler, ssl_context=ssl_context)
+    except OSError:
+        pass
+    if not _port_has_listener(host, port):
+        try:
+            return NodeHTTPServer((host, port), Handler, ssl_context=ssl_context,
+                                  allow_reuse=True)
+        except OSError:
+            pass
+    return None
+
+
 def main():
     global VERBOSE, IDENTITIES, TOKEN
-    global TLS_ENABLED, TLS_PLAINTEXT_DEBUG, CERT_FINGERPRINT
+    global TLS_ENABLED, TLS_PLAINTEXT_DEBUG, CERT_FINGERPRINT, UPLOADS_MANIFEST
     parser = argparse.ArgumentParser(description="CrossDevice 执行器")
-    parser.add_argument("--port", type=int, default=8788)
+    parser.add_argument("--port", type=int, default=None,
+                        help="期望端口（优先级：CLI > node.json 的 port 字段 > 51888；"
+                             "被占用自动 +1 顺延，契约 §16.1）")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--token", default=None,
                         help="设置/覆盖 default 身份令牌；不传则复用配置或自动生成（32 hex）")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--config", default=None,
                         help="node.json 路径（默认 %%LOCALAPPDATA%%\\CrossDevice\\node.json；"
-                             "tls/audit 默认目录相对该文件所在目录解析）")
+                             "tls/audit 默认目录相对该文件所在目录解析；与 --instance 互斥）")
     parser.add_argument("--cert", default=None, help="TLS 证书 PEM 路径（优先于配置）")
     parser.add_argument("--key", default=None, help="TLS 私钥 PEM 路径（优先于配置）")
+    parser.add_argument("--workspace", default=None,
+                        help="工作空间白名单根（逗号分隔，覆盖 node.json 的 workspace；"
+                             "默认空 = 拒绝一切写/删/建目录/移动/上传，契约 §14.1）")
+    parser.add_argument("--instance", default=None,
+                        help="实例名（限 [A-Za-z0-9_-]{1,32}；配置/身份/白名单/审计/任务库/"
+                             "上传清单按实例隔离，TLS 目录共享；与 --config 互斥，契约 §16.2）")
     parser.add_argument("--debug-plaintext", action="store_true",
                         help="调试：主监听端口改以明文 HTTP 服务（默认关闭，D31）")
     args = parser.parse_args()
 
     VERBOSE = args.verbose
 
+    # ---- 多实例与配置文件路径（契约 §16.2）----
+    instance_name = None
+    config_path = args.config
+    if args.instance is not None:
+        if args.config:
+            raise SystemExit("--instance 与 --config 互斥，不能同时指定。")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", args.instance):
+            raise SystemExit("实例名非法：%s（限 [A-Za-z0-9_-]{1,32}）" % args.instance)
+        instance_name = args.instance
+        config_path = os.path.join(default_config_dir(), "node-%s.json" % instance_name)
+
     # ---- 配置与身份（契约 §2 / §9.1）----
-    cfg, identities, config_file = load_config(args)
+    cfg, identities, config_file = load_config(args, config_path)
     IDENTITIES = identities
     TOKEN = next((i["token"] for i in identities if i["name"] == DEFAULT_IDENTITY_NAME),
                  identities[0]["token"] if identities else "")
     base_dir = os.path.dirname(os.path.abspath(config_file))
+
+    # ---- 审计（契约 §8.1；--instance 时为 audit-<名>/，实例隔离 §16.2）----
+    audit_subdir = ("audit-%s" % instance_name) if instance_name else "audit"
     audit_cfg = cfg.get("audit") if isinstance(cfg.get("audit"), dict) else {}
-    set_audit_paths(base_dir, audit_cfg.get("retention_days", 180))
+    set_audit_paths(os.path.join(base_dir, audit_subdir),
+                    audit_cfg.get("retention_days", 180))
     cleanup_audit_files()
+
+    # ---- 工作空间白名单（契约 §14.1）----
+    load_workspace(args, cfg)
+
+    # ---- 任务历史（契约 §15）：建库 → 恢复遗留 running → 启动清理 + 每小时后台清理 ----
+    tasks_db_name = ("tasks-%s.db" % instance_name) if instance_name else "tasks.db"
+    load_tasks_config(cfg)
+    tasks_db_init(os.path.join(base_dir, tasks_db_name))
+    db_recover_running()
+    tasks_cleanup()
+    threading.Thread(target=tasks_retention_loop, daemon=True).start()
+
+    # ---- 上传孤儿清理（契约 §13.5）----
+    uploads_manifest_name = ("uploads-%s.json" % instance_name) if instance_name \
+        else "uploads.json"
+    UPLOADS_MANIFEST = os.path.join(base_dir, uploads_manifest_name)
+    cleanup_upload_orphans()
+
+    # ---- 端口选择（契约 §16.1）：CLI --port > node.json port > 51888 ----
+    if args.port is not None:
+        if not 1 <= args.port <= 65535:
+            raise SystemExit("--port 非法（1–65535）：%d" % args.port)
+        port_expected = args.port
+    else:
+        cfg_port = cfg.get("port")
+        if (isinstance(cfg_port, int) and not isinstance(cfg_port, bool)
+                and 1 <= cfg_port <= 65535):
+            port_expected = cfg_port
+        else:
+            port_expected = DEFAULT_PORT
 
     # ---- TLS（契约 §4.2）----
     ssl_context = None
@@ -1612,29 +2588,48 @@ def main():
     state = desktop_state()
     info = collect_info()
 
-    # 热更新后旧进程可能还没释放端口，重试等待而不是直接失败
+    # ---- 端口绑定（契约 §16.1）：期望端口 +1 顺延，最多 51 个候选 ----
+    # 首个候选最多尝试 6 次（间隔 0.5 秒，兼容热更新重启时旧进程未释放端口的竞态），
+    # 其余候选各尝试 1 次；全部占用 → PORT_EXHAUSTED 说明后非零退出（不经 HTTP）。
     server = None
-    last_error = None
-    for _ in range(24):
-        try:
-            server = NodeHTTPServer((args.host, args.port), Handler,
-                                    ssl_context=ssl_context)
+    actual_port = None
+    for offset in range(51):
+        candidate = port_expected + offset
+        if candidate > 65535:
             break
-        except OSError as exc:
-            last_error = exc
-            time.sleep(0.5)
+        attempts = 6 if offset == 0 else 1
+        for attempt in range(attempts):
+            server = _bind_attempt(args.host, candidate, ssl_context)
+            if server is not None:
+                actual_port = candidate
+                break
+            if attempt < attempts - 1:
+                time.sleep(0.5)
+        if server is not None:
+            break
     if server is None:
-        raise SystemExit("端口 %d 无法监听：%s" % (args.port, last_error))
+        print("PORT_EXHAUSTED：从期望端口 %d 起顺延尝试的候选端口全部不可用，无法启动。"
+              % port_expected)
+        print("可改用 --port <端口> 手动指定端口后重试。")
+        raise SystemExit(1)
     server.daemon_threads = True
 
-    # ---- 启动横幅（契约 §7.1：保留既有行，追加 TLS/身份，访问地址改 https://）----
+    # ---- 端口持久化（契约 §16.1/D35）：把实际端口写回配置文件供下次启动优先复用 ----
+    if cfg.get("port") != actual_port:
+        try:
+            cfg["port"] = actual_port
+            atomic_write_json(config_file, cfg)
+        except Exception as exc:
+            sys.stderr.write("[警告] 端口持久化失败：%s\n" % exc)
+
+    # ---- 启动横幅（契约 §7.1/§16.3：保留既有行，端口用实际绑定值，新增实例行）----
     line = "=" * 62
     print(line)
     print(" CrossDevice 执行器 v%s" % NODE_VERSION)
     print(line)
     print(" 主机名    : %s" % info["hostname"])
     print(" 用户      : %s" % info["user"])
-    print(" 监听      : %s:%d" % (args.host, args.port))
+    print(" 监听      : %s:%d" % (args.host, actual_port))
     if TLS_ENABLED:
         print(" TLS       : 启用（SHA-256 指纹 %s…）" % (CERT_FINGERPRINT or "")[:16])
     else:
@@ -1649,7 +2644,8 @@ def main():
     print(" 显示器    : %d 个" % len(info["monitors"]))
     scheme = "http" if TLS_PLAINTEXT_DEBUG else "https"
     for ip in local_addresses():
-        print(" 访问地址  : %s://%s:%d" % (scheme, ip, args.port))
+        print(" 访问地址  : %s://%s:%d" % (scheme, ip, actual_port))
+    print(" 实例      : %s" % (instance_name or "default"))
     print(line)
     if TLS_PLAINTEXT_DEBUG:
         print(" 警告：明文调试模式已开启（--debug-plaintext），传输不加密，")
