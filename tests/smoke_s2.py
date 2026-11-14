@@ -1020,7 +1020,7 @@ def c7_ports_instances(ctx, opts):
     """C7 端口与实例：配置端口顺延+持久化+复用；51 端口占满 → PORT_EXHAUSTED；
     --instance 两实例并行且文件/任务互不串扰。"""
     version = node_version(ctx)
-    if version != "0.3.0":
+    if version not in ("0.3.0", "0.4.0"):   # S3 起同时接受 0.4.0（SA-3 既定适配，其余断言不变）
         return False, ("node 侧待集成（node_version=%s，S2 端口顺延/多实例未实现，"
                        "跳过重试用例避免无效等待）" % version)
     notes = []

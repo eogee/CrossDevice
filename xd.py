@@ -18,17 +18,34 @@ S2 能力扩展（契约 V1.2，§13/§14/§17/§18）：
     （未指定 --name 时）或报错（显式 --name 时）；
   - `resolve` 两级漂移兜底：条目 ips 逐试 → 主机名重扫 → MAC 兜底（共用一次扫描，
     契约 17.4），一切注册表写路径经 registry_update。
+S3 韧性与并发（契约 V1.3，§19/§20/§21/§22）：
+  - `push-node` 升级为签名推送：条目无 hmac_key 时先调 /v1/update/enroll 获取密钥
+    （经 registry_update 写入条目），本地计算 sha256 + HMAC-SHA256 后推
+    /v1/self-update {"source_b64","sha256","hmac"}；探活发现版本回退或
+    rollback.flag 存在时输出回滚提示（契约 20.5）。对旧 node（< V1.3）：enroll
+    端点不存在 → 404 报错退出；契约 §11 既定：V1.3 起 self-update 缺签名参数
+    → 400 UPDATE_REJECTED（E-02 唯一兼容例外，偏差 9）。
+  - 新增 `pool`：绑定 UDP 51889 接收发现广播（限频去重、30 秒离线判定），
+    接收路径执行端口同步（完整 probe 信任链 + 60 秒冷却，绝不自动 add，
+    契约 19.2/19.4）；
+  - 新增 `release`（释放输入租约）与输入类子命令可选 `--take`（显式抢占，
+    契约 21.3）；
+  - 新增 `elevate`（高权限驻留计划任务安装/移除，契约 22）；
+  - 注册表条目写回补齐 `hmac_key`（S3 第五键，契约 9.2）；
+  - request() 新增可选 extra_headers 参数（既有调用不受影响）。
 既有子命令的输出格式与语义保持不变（E-02，兼容清单第 11 章）。
 """
 
 import argparse
 import base64
 import hashlib
+import hmac
 import http.client
 import json
 import msvcrt
 import os
 import re
+import socket
 import ssl
 import sys
 import time
@@ -83,8 +100,8 @@ def _atomic_write_text(path, text):
 
 
 def _normalize_registry(registry):
-    """写回前补齐新增键（契约 9.2 / 17.2：旧条目任何写回操作补齐
-    identity / cert_fingerprint（S1）与 mac / ips（S2））。"""
+    """写回前补齐新增键（契约 9.2 / 17.2 / 20.1：旧条目任何写回操作补齐
+    identity / cert_fingerprint（S1）与 mac / ips（S2）与 hmac_key（S3））。"""
     devices = registry.get("devices")
     if not isinstance(devices, dict):
         registry["devices"] = {}
@@ -96,6 +113,7 @@ def _normalize_registry(registry):
             device.setdefault("cert_fingerprint", "")
             device.setdefault("mac", "")          # S2：MAC，缺省空（契约 9.2）
             device.setdefault("ips", [])          # S2：全部私网 IPv4 列表
+            device.setdefault("hmac_key", "")     # S3：更新签名密钥，缺省空（契约 9.2/§20.1）
     return registry
 
 
@@ -248,7 +266,13 @@ def _connect_tls(device, timeout, trust=False):
         raise
 
 
-def request(device, method, path, payload=None, timeout=30, raw=False, trust=False):
+def request(device, method, path, payload=None, timeout=30, raw=False, trust=False,
+            extra_headers=None):
+    """业务请求（HTTPS + TOFU + 防重放，契约 3.1/4.3）。
+
+    extra_headers：可选的额外请求头（S3 输入租约 X-Input-Lease 等），
+    与基础头合并后发送（可覆盖同名基础头）；缺省 None 时行为与既有调用完全一致。
+    """
     try:
         conn = _connect_tls(device, timeout, trust=trust)
     except TimeoutError as exc:
@@ -263,6 +287,8 @@ def request(device, method, path, payload=None, timeout=30, raw=False, trust=Fal
             "X-Timestamp": str(int(time.time())),
             "X-Nonce": uuid.uuid4().hex,
         }
+        if extra_headers:
+            headers.update(extra_headers)
         data = None
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -826,8 +852,12 @@ def cmd_shot(args, registry):
 
 def send_input(args, registry, actions):
     device = resolve(registry, args.name, trust=_trust(args))
+    # S3 输入租约（契约 §21.3）：输入类子命令可选 --take → 显式抢占头
+    extra = None
+    if getattr(args, "take", False):
+        extra = {"X-Input-Lease": "take"}
     data = request(device, "POST", "/v1/input", {"actions": actions},
-                   trust=_trust(args))
+                   trust=_trust(args), extra_headers=extra)
     if args.json:
         dump(data)
         return
@@ -1041,23 +1071,378 @@ def cmd_get(args, registry):
         args.remote, args.local, human_size(total)))
 
 
+def _version_tuple(text):
+    """版本字符串 → 可比较整数元组（"0.4.1-c1" → (0, 4, 1, 1)），供回退判定。"""
+    parts = re.findall(r"\d+", str(text or ""))
+    return tuple(int(p) for p in parts) if parts else (0,)
+
+
 def cmd_push_node(args, registry):
+    """签名推送（契约 §20.5 / §6.8，V1.3 起 self-update 签名必填，偏差 9）：
+
+    - 条目无 hmac_key → 先 POST /v1/update/enroll 获取密钥并经 registry_update
+      写入条目（hmac_key 永不落审计/日志，契约 §20.1）；
+    - 本地计算 sha256（64hex 小写）与 HMAC-SHA256(hmac_key, sha256) 后推
+      /v1/self-update {"source_b64","sha256","hmac"}；
+    - 推送后既有 15×1s 探活循环：新版本低于推送前 → 输出看门狗回滚提示；
+      /v1/health 的 rollback_flag == true → 输出 rollback.flag 处置提示。
+    - 对旧 node（< V1.3）既定行为：enroll 端点不存在 → 404 报错退出（契约 §11）。
+    """
     source = Path(args.file) if args.file else NODE_SOURCE
     if not source.exists():
         raise SystemExit("找不到执行器源码：%s" % source)
     payload = source.read_bytes()
     device = resolve(registry, args.name, trust=_trust(args))
+    name = device.get("name") or ""
+
+    # §20.5：条目无 hmac_key → 先 enroll（重复调用 = 轮换，旧密钥随即失效）
+    hmac_key = str(device.get("hmac_key") or "").strip()
+    if not hmac_key:
+        data = request(device, "POST", "/v1/update/enroll", {},
+                       timeout=30, trust=_trust(args))
+        hmac_key = str((data or {}).get("hmac_key") or "").strip()
+        if not hmac_key:
+            raise SystemExit("enroll 未返回更新签名密钥，无法签名推送")
+        device["hmac_key"] = hmac_key
+
+        def set_key(entry):
+            entry["hmac_key"] = hmac_key
+
+        _persist_device(name, set_key)      # 注册表写唯一入口（契约 9.2）
+        print("已获取更新签名密钥（/v1/update/enroll）")
+
+    sha256_hex = hashlib.sha256(payload).hexdigest()
+    signature = hmac.new(hmac_key.encode("utf-8"), sha256_hex.encode("utf-8"),
+                         hashlib.sha256).hexdigest()
+
+    # 记录推送前版本（看门狗回滚判定基准：回滚后版本号会低于推送前）
+    pre_version = None
+    try:
+        info = request(device, "GET", "/v1/info", timeout=8, trust=_trust(args))
+        pre_version = str((info or {}).get("node_version") or "") or None
+    except Exception:
+        pre_version = None                  # 推送前不可达：跳过版本回退判定
+
     request(device, "POST", "/v1/self-update", {
         "source_b64": base64.b64encode(payload).decode("ascii"),
+        "sha256": sha256_hex,
+        "hmac": signature,
     }, timeout=30, trust=_trust(args))
     print("已推送 %s（%s），执行器正在重启..." % (source, human_size(len(payload))))
     for _ in range(15):
         time.sleep(1)
         if probe(device, trust=_trust(args)):
-            version = request(device, "GET", "/v1/info", trust=_trust(args))["node_version"]
+            info = request(device, "GET", "/v1/info", timeout=10, trust=_trust(args))
+            version = str((info or {}).get("node_version") or "")
+            # §20.5：版本恢复后低于推送前版本 → 更新已被看门狗回滚
+            if pre_version and version \
+                    and _version_tuple(version) < _version_tuple(pre_version):
+                print("更新已被看门狗回滚（rollback.flag 已写入，请人工处置）")
+            try:
+                health = request(device, "GET", "/v1/health", timeout=10,
+                                 trust=_trust(args))
+                if isinstance(health, dict) and health.get("rollback_flag") is True:
+                    print("检测到 rollback.flag（历史回滚未处置，请人工确认）")
+            except Exception:
+                pass                        # 旧 node 无 rollback_flag 字段，忽略
             print("重启完成，当前版本 v%s" % version)
             return
     raise SystemExit("执行器重启后无响应，请到目标机查看窗口输出")
+
+
+# --------------------------------------------------------------------------
+# S3 新增命令（契约 §19 设备池 / §21 输入租约 / §22 高权限驻留）
+# --------------------------------------------------------------------------
+
+POOL_PORT = 51889           # 发现广播 UDP 端口（契约 §19.1/§19.2，D28）
+POOL_OFFLINE_SECS = 30      # 30 秒无帧判离线（D25）
+POOL_RATE_SECS = 1.0        # (源IP, device_id) 每秒最多接受 1 帧（B31/D38）
+POOL_SYNC_COOLDOWN = 60.0   # 端口同步每 (条目名, 帧端口) 组合冷却（§19.4 防抖）
+
+
+def _pool_frame_valid(data):
+    """广播报文校验（契约 §19.2）：≤512B、UTF-8 单行 JSON、magic=="XDCAST"、
+    proto==1、device_id 为 1–12 位十六进制；非法一律静默丢弃（广播来源不可信，
+    防日志洪泛）。合法返回解析后的 dict。"""
+    if not data or len(data) > 512:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if "\n" in text or "\r" in text:
+        return None
+    try:
+        msg = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(msg, dict):
+        return None
+    if msg.get("magic") != "XDCAST" or msg.get("proto") != 1:
+        return None
+    device_id = msg.get("device_id")
+    if not isinstance(device_id, str) \
+            or not re.fullmatch(r"[0-9a-fA-F]{1,12}", device_id):
+        return None
+    return msg
+
+
+def _pool_port_sync(msg, src_ip, cooldown):
+    """端口同步（契约 §19.4，B29 后半收口 / D35）：
+
+    触发条件（全部满足）：帧匹配注册表条目（优先 帧 device_id == 条目
+    info.device_id 精确匹配；条目 info 无 device_id 时回退 hostname 大小写
+    不敏感精确匹配）→ 帧 port ≠ 条目 port → 条目现地址（ip:port）探测失败。
+    动作：向广播源 ip:port 发完整 probe（直接复用 request()：TLS + TOFU 指纹 +
+    条目令牌 + 防重放全链）→ 成功且指纹一致 → 经 registry_update 更新
+    port + last_seen；失败（含 TOFU 指纹不一致）不动。
+    每 (条目名, 帧端口) 组合 60 秒冷却（无论成败）。绝不自动 add、
+    绝不写注册表其他字段（D38 发现与授权分离）。
+    """
+    try:
+        registry = load_registry()
+    except Exception:
+        return
+    devices = registry.get("devices") or {}
+    device_id = str(msg.get("device_id") or "").lower()
+    hostname = str(msg.get("hostname") or "")
+    matched_name = None
+    for name, entry in devices.items():
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str((entry.get("info") or {}).get("device_id") or "").lower()
+        if entry_id and entry_id == device_id:
+            matched_name = name
+            break
+    if matched_name is None and hostname:
+        # 回退仅对 info 无 device_id 的条目生效（精确匹配防同机多 node 撞车）
+        for name, entry in devices.items():
+            if not isinstance(entry, dict):
+                continue
+            info = entry.get("info") or {}
+            if info.get("device_id"):
+                continue
+            entry_host = str(info.get("hostname") or "")
+            if entry_host and entry_host.lower() == hostname.lower():
+                matched_name = name
+                break
+    if matched_name is None:
+        return
+    entry = devices[matched_name]
+    frame_port = msg.get("port")
+    if not isinstance(frame_port, int) or isinstance(frame_port, bool) \
+            or not 1 <= frame_port <= 65535:
+        return
+    if frame_port == entry.get("port"):
+        return
+    key = (matched_name, frame_port)
+    now = time.time()
+    if now - cooldown.get(key, 0.0) < POOL_SYNC_COOLDOWN:
+        return
+    cooldown[key] = now                       # 无论成败先记冷却（防抖，契约 §19.4）
+
+    base = {
+        "name": matched_name,
+        "token": entry.get("token"),
+        "identity": entry.get("identity") or "default",
+        "cert_fingerprint": entry.get("cert_fingerprint") or "",
+    }
+    # 前置：条目现地址（ip:port）可达 → 不修改（避免同主机多 node 场景误写）
+    current = dict(base, ip=entry.get("ip"), port=entry.get("port"))
+    try:
+        request(current, "GET", "/v1/health", timeout=3)
+        return
+    except Exception:
+        pass
+    # 向广播源 ip:帧端口 发完整 probe（TOFU 指纹不一致 → 异常 → 失败不动）
+    trial = dict(base, ip=src_ip, port=frame_port)
+    try:
+        data = request(trial, "GET", "/v1/health", timeout=5)
+        ok = isinstance(data, dict) and data.get("status") == "up"
+    except Exception:
+        ok = False
+    if not ok:
+        return
+
+    def fn(reg):
+        target = reg["devices"].get(matched_name)
+        if isinstance(target, dict):
+            target["port"] = frame_port
+            target["last_seen"] = time.time()
+
+    registry_update(fn)                       # 注册表写唯一入口（契约 9.2）
+    print("端口同步：%s 端口 %s -> %d（经广播 probe 校正）"
+          % (matched_name, entry.get("port"), frame_port))
+
+
+def _pool_accept(pool, rate, cooldown, addr, data):
+    """单帧处理：校验 → (源IP, device_id) 限频去重 → 刷新池 → 端口同步。"""
+    msg = _pool_frame_valid(data)
+    if msg is None:
+        return
+    src_ip = addr[0]
+    device_id = msg["device_id"].lower()
+    now = time.time()
+    rate_key = (src_ip, device_id)
+    if now - rate.get(rate_key, 0.0) < POOL_RATE_SECS:
+        return                                # 限频：超出每秒 1 帧的部分丢弃（不计数）
+    rate[rate_key] = now
+    entry = pool.setdefault(device_id, {
+        "ip": src_ip, "hostname": "", "port": 0, "version": "", "caps": [],
+        "first_seen": now, "last_seen": now, "frames": 0,
+    })
+    entry["ip"] = src_ip                      # 池结构（契约 §19.2）：源 IP + 帧内容刷新
+    entry["hostname"] = str(msg.get("hostname") or "")
+    port = msg.get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
+        entry["port"] = port
+    entry["version"] = str(msg.get("version") or "")
+    caps = msg.get("caps")
+    entry["caps"] = [str(c) for c in caps] if isinstance(caps, list) else []
+    entry["last_seen"] = now
+    entry["frames"] += 1                      # frames 计接受帧数
+    _pool_port_sync(msg, src_ip, cooldown)
+
+
+def _pool_online(entry):
+    return (time.time() - entry.get("last_seen", 0)) <= POOL_OFFLINE_SECS
+
+
+def _pool_hhmmss(value):
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(float(value)))
+    except Exception:
+        return "-"
+
+
+def _pool_render(pool, as_json):
+    """设备池快照输出（契约 §19.2）：--json 输出快照 JSON（含在线状态字段）；
+    否则打印表格（状态/device_id/源IP/端口/版本/主机名/帧数/首见/最近，
+    now-last_seen > 30 秒标注"离线"）。不落盘、退出不改任何持久状态。"""
+    now = time.time()
+    snapshot = {}
+    for device_id, entry in pool.items():
+        item = dict(entry)
+        item["online"] = (now - entry.get("last_seen", 0)) <= POOL_OFFLINE_SECS
+        snapshot[device_id] = item
+    if as_json:
+        print(json.dumps({
+            "ts": now,
+            "count": len(snapshot),
+            "online": sum(1 for v in snapshot.values() if v["online"]),
+            "devices": snapshot,
+        }, ensure_ascii=False, indent=2))
+        return
+    print("%-6s %-14s %-15s %-6s %-8s %-18s %-6s %-9s %-9s" % (
+        "状态", "device_id", "源IP", "端口", "版本", "主机名", "帧数", "首见", "最近"))
+    print("-" * 100)
+    for device_id, item in sorted(snapshot.items()):
+        print("%-6s %-14s %-15s %-6s %-8s %-18s %-6d %-9s %-9s" % (
+            "在线" if item["online"] else "离线",
+            _truncate(device_id, 14),
+            _truncate(str(item["ip"] or "-"), 15),
+            item["port"] or "-",
+            _truncate(str(item["version"] or "-"), 8),
+            _truncate(str(item["hostname"] or "-"), 18),
+            item["frames"],
+            _pool_hhmmss(item["first_seen"]),
+            _pool_hhmmss(item["last_seen"])))
+    print("-" * 100)
+    print("共 %d 台（在线 %d）" % (
+        len(snapshot), sum(1 for v in snapshot.values() if v["online"])))
+
+
+def cmd_pool(args, registry):
+    """设备池（契约 §19.2/§19.4）：仅本子命令期间绑定 UDP 51889 接收发现广播
+    （SO_REUSEADDR；控制面仍零监听，D25）。设备池为内存结构（不落盘、不跨进程）；
+    广播是未认证信息：不自动信任、不自动 add（唯一例外：§19.4 端口同步）。
+
+    - 默认：持续监听并每 2 秒重印设备池表格（Ctrl+C 退出）；
+    - --seconds N：采样 N 秒后输出一次快照退出（快照同样含离线标注）；
+    - --json：输出快照 JSON（仅与 --seconds 搭配，持续模式忽略）。
+    """
+    seconds = getattr(args, "seconds", None)
+    as_json = bool(getattr(args, "json", False)) and bool(seconds)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", POOL_PORT))
+    except OSError as exc:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise SystemExit("无法绑定 UDP %d（可能被其他程序占用）：%s" % (POOL_PORT, exc))
+    sock.settimeout(0.4)
+    pool, rate, cooldown = {}, {}, {}
+    deadline = (time.time() + seconds) if seconds and seconds > 0 else None
+    next_render = 0.0
+    try:
+        while True:
+            if deadline is not None and time.time() >= deadline:
+                break
+            data = None
+            try:
+                data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                pass
+            except OSError:
+                pass
+            if data:
+                try:
+                    _pool_accept(pool, rate, cooldown, addr, data)
+                except Exception:
+                    pass                      # 单帧处理异常不影响接收循环
+            if deadline is None and time.time() >= next_render:
+                _pool_render(pool, False)     # 持续模式每 2 秒重印表格
+                next_render = time.time() + 2.0
+    except KeyboardInterrupt:
+        pass                                  # Ctrl+C 正常退出
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    _pool_render(pool, as_json)
+
+
+def cmd_release(args, registry):
+    """释放输入租约（契约 §21.3）：POST /v1/input 空 actions（空 actions 合法）
+    + 头 X-Input-Lease: release；成功输出"已释放输入租约"；400/409 经既有错误路径。"""
+    device = resolve(registry, args.name, trust=_trust(args))
+    data = request(device, "POST", "/v1/input", {"actions": []},
+                   trust=_trust(args),
+                   extra_headers={"X-Input-Lease": "release"})
+    if getattr(args, "json", False):
+        dump(data)
+        return
+    print("已释放输入租约")
+
+
+def cmd_elevate(args, registry):
+    """高权限驻留引导（契约 §22）：默认 POST /v1/elevate/install（可选 --task-name）；
+    --remove 调 POST /v1/elevate/remove（幂等，计划任务不存在也返回 removed）。
+    install 会经 node 侧 ShellExecuteW("runas") 触发 UAC（用户确认后创建
+    schtasks onlogon /rl highest 计划任务）；UAC 拒绝/超时 → node 明确报错。"""
+    device = resolve(registry, args.name, trust=_trust(args))
+    payload = {}
+    if getattr(args, "task_name", None):
+        payload["task_name"] = args.task_name
+    if getattr(args, "remove", False):
+        data = request(device, "POST", "/v1/elevate/remove", payload,
+                       trust=_trust(args))
+        if getattr(args, "json", False):
+            dump(data)
+            return
+        print("已移除高权限驻留计划任务 %s" % (data.get("task_name") or "-"))
+        return
+    data = request(device, "POST", "/v1/elevate/install", payload,
+                   trust=_trust(args))
+    if getattr(args, "json", False):
+        dump(data)
+        return
+    print("已安装高权限驻留计划任务 %s（开机登录后以最高权限自启）"
+          % (data.get("task_name") or "-"))
 
 
 # --------------------------------------------------------------------------
@@ -1239,6 +1624,8 @@ def build_parser():
     p.add_argument("y", type=int)
     p.add_argument("--button", default="left", choices=["left", "right", "middle"])
     p.add_argument("--double", action="store_true")
+    p.add_argument("--take", action="store_true",
+                   help="显式抢占输入租约（S3，X-Input-Lease: take）")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_click)
 
@@ -1246,18 +1633,24 @@ def build_parser():
     p.add_argument("name")
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
+    p.add_argument("--take", action="store_true",
+                   help="显式抢占输入租约（S3，X-Input-Lease: take）")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_move)
 
     p = sub.add_parser("type", parents=[common], help="输入文本")
     p.add_argument("name")
     p.add_argument("text")
+    p.add_argument("--take", action="store_true",
+                   help="显式抢占输入租约（S3，X-Input-Lease: take）")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_type)
 
     p = sub.add_parser("key", parents=[common], help="按键，如 enter / ctrl+a")
     p.add_argument("name")
     p.add_argument("combo")
+    p.add_argument("--take", action="store_true",
+                   help="显式抢占输入租约（S3，X-Input-Lease: take）")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_key)
 
@@ -1313,6 +1706,8 @@ def build_parser():
     p = sub.add_parser("wheel", parents=[common], help="滚轮滚动（负值向上）")
     p.add_argument("name")
     p.add_argument("delta", type=int, help="滚动量，可为负")
+    p.add_argument("--take", action="store_true",
+                   help="显式抢占输入租约（S3，X-Input-Lease: take）")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_wheel)
 
@@ -1351,6 +1746,24 @@ def build_parser():
     p.add_argument("dst")
     p.add_argument("--trust", action="store_true", help=TRUST_HELP)
     p.set_defaults(func=cmd_mv)
+
+    p = sub.add_parser("pool", parents=[common], help="监听发现广播并显示设备池（S3）")
+    p.add_argument("--seconds", type=int, default=None,
+                   help="采样 N 秒后输出一次快照退出（缺省持续模式，每 2 秒重印）")
+    p.set_defaults(func=cmd_pool)
+
+    p = sub.add_parser("release", parents=[common], help="释放设备输入租约（S3）")
+    p.add_argument("name")
+    p.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    p.set_defaults(func=cmd_release)
+
+    p = sub.add_parser("elevate", parents=[common], help="高权限驻留计划任务安装/移除（S3）")
+    p.add_argument("name")
+    p.add_argument("--task-name", default=None,
+                   help="计划任务名（缺省由 node 决定，默认 CrossDeviceNode）")
+    p.add_argument("--remove", action="store_true", help="移除驻留计划任务（幂等）")
+    p.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    p.set_defaults(func=cmd_elevate)
 
     return parser
 

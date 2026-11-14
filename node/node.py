@@ -7,8 +7,8 @@ CrossDevice 执行器（node）
 零第三方依赖，仅使用 Python 标准库 + ctypes 调用 Win32 API。
 
 提供能力：
-    /v1/health        健康检查
-    /v1/info          环境自检（交互会话 / 锁屏 / 提权 / DPI / 显示器 / 地址）
+    /v1/health        健康检查（S3 增 rollback_flag 回滚标记）
+    /v1/info          环境自检（S3 增 device_id / elevated_resident）
     /v1/exec          启动命令任务，返回 job_id（创建即写入任务历史）
     /v1/job/<id>      查询任务结果（wait 长轮询；内存 miss 后查任务历史库）
     /v1/fs/list       列目录
@@ -24,16 +24,21 @@ CrossDevice 执行器（node）
     /v1/task/list     任务历史列表（一期仅本人可见，S2 新增）
     /v1/task/<id>     任务详情（S2 新增）
     /v1/screen        截屏，返回 PNG
-    /v1/input         鼠标键盘注入
+    /v1/input         鼠标键盘注入（S3 起受输入租约约束，X-Input-Lease 头）
     /v1/audit         审计日志查询（S1 新增）
-    /v1/self-update   热更新自身源码并重启
+    /v1/self-update   热更新自身源码并重启（V1.3 起要求 sha256+HMAC 签名，§20）
+    /v1/update/enroll  轮换更新签名密钥 hmac_key（S3 新增，§20.1）
+    /v1/update/pin     追加可信 sha256 白名单（S3 新增，§20.2）
+    /v1/elevate/install 高权限驻留计划任务安装引导（S3 新增，§22）
+    /v1/elevate/remove 高权限驻留计划任务清理（S3 新增，§22）
 
-安全基线（S1，唯一行为依据 docs/接口契约.md V1.2）：
+安全基线（S1，唯一行为依据 docs/接口契约.md）：
     - 传输：默认 HTTPS（TLS 1.3，自签证书 + TOFU）；--debug-plaintext 才回退明文（D31）
     - 身份：node.json 多控制端身份（tokens 列表），令牌用 hmac.compare_digest 常量时间比较
     - 防重放：每个 /v1/* 请求必须带 X-Timestamp / X-Nonce，nonce 仅内存缓存（重启清空）
     - 审计：<config 目录>/audit/audit-YYYYMMDD.jsonl 追加写，默认留存 180 天；
-      业务 403（SANDBOX_DENIED 白名单越界）落审计且 target 照常（§8.2）
+      业务 403（SANDBOX_DENIED）与 S3 例外（409 INPUT_LEASE_TAKEN / 400 UPDATE_REJECTED）
+      落审计且 target 照常（§8.2）
     - 新端点一律过同一 guard 链：私网来源 → 身份 → 防重放 → 审计
 
 能力扩展（S2，契约 §13–§17）：
@@ -42,10 +47,24 @@ CrossDevice 执行器（node）
     - 任务历史：sqlite 落库（tasks.db）、/v1/task/list 与详情、留存先到先清（§15）
     - 端口与多实例：默认 51888、占用 +1 顺延并持久化、--instance 实例隔离（§16）
 
+能力扩展（S3，契约 §19–§22）：
+    - 发现广播：UDP 51889 XDCAST 帧（device_id/hostname/port/version/caps/ts），
+      启动即发 1 帧 + 每 10 秒心跳；只发送不监听；报文不含任何凭据（§19.1，D38）
+    - 更新签名：device_id 与 update.hmac_key 首次自动生成并持久化；self-update 按
+      sha256 → HMAC-SHA256 → trusted_hashes 白名单顺序校验（任一失败 400 UPDATE_REJECTED
+      且不落盘）；替换前备份 .bak + version.json；替换后 detached 拉起一次性看门狗（§20）
+    - 输入租约：X-Input-Lease acquire/renew/release/take 全语义、过期惰性判定、
+      被抢占一次性标记（下一次请求 409 INPUT_LEASE_TAKEN）（§21，D21）
+    - 高权限驻留：/v1/elevate/install 经 ShellExecuteW runas + schtasks（登录触发 +
+      最高权限）引导，UAC 拒绝/超时明确报错；remove 幂等清理（§22，D22）
+    - 健康与展示：/v1/health 增 rollback_flag；横幅增 驻留 行；CLI 增
+      --elevate-task-install / --elevate-task-remove 提权子命令
+
 启动方式：
     python node.py [--port 51888] [--host 0.0.0.0] [--token <令牌>] [--verbose]
                    [--config <node.json 路径>] [--cert <cert.pem> --key <key.pem>]
                    [--workspace "<根1>,<根2>"] [--instance <名>] [--debug-plaintext]
+                   [--elevate-task-install <名>] [--elevate-task-remove <名>]
 """
 
 import argparse
@@ -75,7 +94,7 @@ from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-NODE_VERSION = "0.3.0"
+NODE_VERSION = "0.4.0"
 MAX_OUTPUT = 256 * 1024          # 单个任务输出上限
 MAX_BODY = 64 * 1024 * 1024      # 请求体上限
 DEFAULT_PORT = 51888             # S2 默认端口（D28/B20，偏差 7；契约 §16.1）
@@ -98,6 +117,28 @@ AUDIT_LOCK = threading.Lock()       # 审计追加写锁
 NONCES = {}                         # nonce -> 过期时刻，仅内存、重启清空（§3.2）
 NONCES_LOCK = threading.Lock()      # nonce 查重/写入共用一把锁（§3.2）
 
+# ---- S3 韧性层全局状态（契约 V1.3）----
+DEFAULT_ELEVATE_TASK = "CrossDeviceNode"   # 高权限驻留计划任务默认名（§22.1）
+DEVICE_ID = ""                      # 12hex 设备标识（§19.1，首次启动生成并持久化 node.json）
+UPDATE_HMAC_KEY = ""                # self-update 签名密钥 64hex（§20.1，缺失自动生成并写回）
+TRUSTED_HASHES = []                 # 可信 sha256 白名单（§20.2，/v1/update/pin 维护，上限 16）
+MAX_TRUSTED_HASHES = 16             # trusted_hashes 上限（§20.2）
+UPDATE_LOCK = threading.Lock()      # hmac_key / trusted_hashes 内存态互斥
+INPUT_LEASE_SECONDS = 60            # 输入租约时长秒（§21.1：下限 5、缺省 60、非法回退默认）
+INPUT_LEASE = {"holder": None, "acquired_at": None, "expires_at": None}   # §21.1 内存租约
+INPUT_LEASE_LOCK = threading.Lock() # 租约读写互斥（§21.1）
+INPUT_LEASE_PREEMPTED = set()       # 被抢占身份的一次性标记集合（§21.1，D21）
+ELEVATED_TASK_NAME = None           # 高权限驻留计划任务名（§22；None = 未驻留）
+CONFIG_FILE = ""                    # 当前配置文件绝对路径（S3 键持久化用）
+ACTUAL_PORT = 0                     # 实际绑定端口（广播帧 / 看门狗拉起参数用，§16.1）
+DETACHED_PROCESS = 0x00000008       # detached 启动标志（看门狗/重启进程，§20.4）
+
+# ---- S3 发现广播（§19.1，D28/D25/D38）----
+BROADCAST_PORT = 51889              # UDP 发现广播端口（仅发送，不监听）
+BROADCAST_INTERVAL = 10             # 心跳间隔秒（D25：启动即发 1 帧 + 每 10 秒 1 帧）
+BROADCAST_MAX_BYTES = 512           # 报文上限字节（§19.1：超限跳过不截断）
+BROADCAST_CAPS = ["exec", "screen", "input", "fs", "update", "elevate"]   # §19.1 能力表
+
 if os.name != "nt":
     raise SystemExit("node.py 仅支持 Windows（当前系统：%s）" % os.name)
 
@@ -108,6 +149,7 @@ if os.name != "nt":
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+shell32 = ctypes.WinDLL("shell32", use_last_error=True)   # ShellExecuteExW 提权（§22.1）
 
 HANDLE = wintypes.HANDLE
 HDC = wintypes.HDC
@@ -505,6 +547,9 @@ def collect_info():
         "identity_count": len(IDENTITIES),
         # S2 新增字段（契约 §6.2/§17.1）：本机私网 IPv4 列表
         "addresses": local_addresses(),
+        # S3 新增字段（契约 §6.2/§19.1/§22.2）：设备标识与高权限驻留标记
+        "device_id": DEVICE_ID,
+        "elevated_resident": ELEVATED_TASK_NAME is not None,
     }
 
 
@@ -1281,7 +1326,7 @@ def upload_abort(upload_id):
 
 
 # --------------------------------------------------------------------------
-# 自更新
+# 自更新（契约 §6.8 / §20：签名校验 → 备份 → 替换 → 看门狗 → 重启）
 # --------------------------------------------------------------------------
 
 def schedule_restart(delay=2):
@@ -1299,13 +1344,108 @@ def schedule_restart(delay=2):
     )
     with open(bat, "w", encoding="mbcs", errors="replace") as fh:
         fh.write(content)
-    DETACHED_PROCESS = 0x00000008
     subprocess.Popen(["cmd", "/c", bat],
                      creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
                      close_fds=True)
 
 
-def self_update(source):
+def sha256_file(path, block_size=DOWNLOAD_BLOCK):
+    """分块流式计算文件 SHA-256（64hex 小写）；读取失败抛出原异常。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            block = fh.read(block_size)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def update_signature_verify(source, sha256_claim, hmac_claim):
+    """更新包签名校验（契约 §20.2，校验顺序冻结；任一失败即拒绝且不落盘）。
+
+    顺序：① sha256 与解码后源码实际 sha256 一致（常量时间比较）；
+          ② hmac 与 HMAC-SHA256(key=utf8(hmac_key), msg=utf8(sha256 小写)) 一致；
+             节点无 hmac_key → 拒绝；
+          ③ trusted_hashes 非空时强制 sha256 ∈ 白名单（空 = 仅 HMAC，一期默认）。
+
+    通过返回 None；失败返回中文错误信息（调用方 → 400 UPDATE_REJECTED）。
+    缺 sha256/hmac（旧格式）同样返回错误信息（E-02 唯一兼容例外，偏差 9）。
+    """
+    if not isinstance(sha256_claim, str) or not isinstance(hmac_claim, str):
+        return "缺少 sha256/hmac 签名参数（V1.3 起旧格式请求不再支持）"
+    # ① sha256 与实际解码内容一致
+    actual_sha = hashlib.sha256(source).hexdigest()
+    if not hmac.compare_digest(sha256_claim.encode("utf-8", "replace"),
+                               actual_sha.encode("ascii")):
+        return "更新包校验失败：sha256 与源码实际内容不一致"
+    # ② HMAC-SHA256 签名（key 为 hmac_key 64hex 字符串的 UTF-8 编码）
+    if not UPDATE_HMAC_KEY:
+        return "更新包校验失败：节点无更新签名密钥（未 enroll）"
+    expected = hmac.new(UPDATE_HMAC_KEY.encode("utf-8"),
+                        sha256_claim.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(hmac_claim.encode("utf-8", "replace"),
+                               expected.encode("ascii")):
+        return "更新包校验失败：HMAC 签名不匹配"
+    # ③ 白名单（非空时强制）
+    with UPDATE_LOCK:
+        trusted = list(TRUSTED_HASHES)
+    if trusted and sha256_claim not in trusted:
+        return "更新包校验失败：sha256 不在可信哈希白名单中（请先 /v1/update/pin）"
+    return None
+
+
+def launch_watchdog_once(bak_path, port):
+    """替换成功后以 detached 方式拉起一次性看门狗（契约 §20.4，D33）。
+
+    看门狗路径依次尝试 <node.py 同目录>/watchdog.py → <node.py 同目录>/../watchdog.py；
+    均不存在 → 跳过拉起并 stderr 告警（更新仍执行，回滚保护缺失）。
+    返回看门狗进程 pid；未拉起返回 None。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    watchdog = None
+    for candidate in (os.path.join(here, "watchdog.py"),
+                      os.path.abspath(os.path.join(here, os.pardir, "watchdog.py"))):
+        if os.path.isfile(candidate):
+            watchdog = candidate
+            break
+    if watchdog is None:
+        sys.stderr.write("[警告] 未找到 watchdog.py（%s 或其上级目录），"
+                         "跳过看门狗拉起：本次更新无自动回滚保护\n" % here)
+        return None
+    # --args 与 schedule_restart 同款透传口径：进程直拉按 list2cmdline 逐参数引号化拼串
+    argv = [sys.executable, watchdog,
+            "--node", os.path.abspath(__file__),
+            "--python", sys.executable,
+            "--args", subprocess.list2cmdline(sys.argv[1:]),
+            "--bak", os.path.abspath(bak_path),
+            "--once", "--grace", "60",
+            "--port", str(port)]
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+                                close_fds=True)
+        if VERBOSE:
+            sys.stderr.write("[信息] 看门狗已拉起（pid %d）：%s\n" % (proc.pid, watchdog))
+        return proc.pid
+    except OSError as exc:
+        sys.stderr.write("[警告] 看门狗拉起失败：%s（更新仍执行，回滚保护缺失）\n" % exc)
+        return None
+
+
+def rollback_flag_exists():
+    """node.py 同目录是否存在 rollback.flag（§6.1/§20.4）；每次实时判断文件存在性。"""
+    return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "rollback.flag"))
+
+
+def self_update(source, port):
+    """热更新替换（契约 §20.3，签名校验已由调用方完成）：
+    写 .new → 语法编译校验 → 备份 .bak（覆盖）→ 原子写 version.json →
+    os.replace 替换 → detached 拉起一次性看门狗 → bat 延迟重启。
+    语法校验失败抛 ValueError（调用方 → 400 BAD_REQUEST，"源码语法错误"文案维持现状）。
+    """
     target = os.path.abspath(__file__)
     temp = target + ".new"
     with open(temp, "wb") as fh:
@@ -1315,7 +1455,42 @@ def self_update(source):
     except SyntaxError as exc:
         os.remove(temp)
         raise ValueError("源码语法错误：%s" % exc)
-    os.replace(temp, target)
+    # 备份当前 node.py（覆盖旧备份，node.py 同目录，§20.3/D13）
+    bak = target + ".bak"
+    shutil.copyfile(target, bak)
+    try:
+        old_sha = sha256_file(target)
+    except OSError as exc:
+        os.remove(temp)
+        raise RuntimeError("备份失败：无法读取当前 node.py（%s）" % exc)
+    # 版本记录（同目录原子写，§20.3）
+    try:
+        atomic_write_json(os.path.join(os.path.dirname(target), "version.json"), {
+            "old_sha256": old_sha,
+            "new_sha256": hashlib.sha256(source).hexdigest(),
+            "ts": time.time(),
+        })
+    except OSError as exc:
+        os.remove(temp)
+        raise RuntimeError("版本记录写入失败：%s" % exc)
+    # os.replace 带 10×0.1s 短重试：Windows 实时扫描可能瞬时占用 node.py.new /
+    # node.py 造成 WinError 5（与 upload_commit 落盘同款防护）
+    last_exc = None
+    for _ in range(10):
+        try:
+            os.replace(temp, target)
+            last_exc = None
+            break
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(0.1)
+    if last_exc is not None:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        raise RuntimeError("替换失败：%s" % last_exc)
+    launch_watchdog_once(bak, port)
     schedule_restart()
     return {"path": target, "bytes": len(source)}
 
@@ -1448,6 +1623,125 @@ def match_identity(supplied):
         if hmac.compare_digest(supplied_b, item["token"].encode("utf-8")):
             return item["name"]
     return None
+
+
+# --------------------------------------------------------------------------
+# S3 配置持久化与新键初始化（契约 §9.1 / §19.1 / §20.1 / §21.1 / §22）
+# --------------------------------------------------------------------------
+
+def persist_config(mutator):
+    """读改写当前配置文件（S3：enroll/pin/elevate 使用）：读盘最新内容 → mutator 修改 →
+    原子写回。读失败按空配置处理（写回时保留 tokens 等既有键由读盘内容保证）。"""
+    cfg = {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except (OSError, ValueError):
+        cfg = {}
+    mutator(cfg)
+    atomic_write_json(CONFIG_FILE, cfg)
+
+
+def ensure_s3_config(cfg, config_file):
+    """node.json S3 新键初始化（契约 §9.1/§19.1/§20.1/§21.1/§22）：
+    - device_id：缺失或非法 → uuid4().hex[:12] 生成并原子写回（§19.1）；
+    - update.hmac_key：缺失或非法 → os.urandom(32).hex() 生成并原子写回（§20.1）；
+      trusted_hashes 缺省 []；
+    - input.lease_seconds：下限 5、缺省 60、非法回退默认（§21.1）；
+    - elevated：缺省视为未驻留（§22）。
+    仅在发生变更时写盘；输入/驻留键仅读入内存，不主动写盘（缺省兼容）。
+    """
+    global DEVICE_ID, UPDATE_HMAC_KEY, TRUSTED_HASHES, INPUT_LEASE_SECONDS
+    global ELEVATED_TASK_NAME
+    changed = False
+
+    device_id = cfg.get("device_id")
+    if isinstance(device_id, str) and re.fullmatch(r"[0-9a-f]{12}", device_id):
+        DEVICE_ID = device_id
+    else:
+        DEVICE_ID = uuid.uuid4().hex[:12]
+        cfg["device_id"] = DEVICE_ID
+        changed = True
+
+    update_cfg = cfg.get("update") if isinstance(cfg.get("update"), dict) else None
+    if update_cfg is None:
+        update_cfg = {}
+        cfg["update"] = update_cfg
+        changed = True
+    hmac_key = update_cfg.get("hmac_key")
+    if isinstance(hmac_key, str) and re.fullmatch(r"[0-9a-f]{64}", hmac_key):
+        UPDATE_HMAC_KEY = hmac_key
+    else:
+        UPDATE_HMAC_KEY = os.urandom(32).hex()
+        update_cfg["hmac_key"] = UPDATE_HMAC_KEY
+        changed = True
+    hashes = update_cfg.get("trusted_hashes")
+    if isinstance(hashes, list):
+        TRUSTED_HASHES = [h for h in hashes
+                          if isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)]
+        if len(TRUSTED_HASHES) != len(hashes):
+            update_cfg["trusted_hashes"] = TRUSTED_HASHES
+            changed = True
+    else:
+        TRUSTED_HASHES = []
+
+    input_cfg = cfg.get("input") if isinstance(cfg.get("input"), dict) else {}
+    try:
+        lease_seconds = int(input_cfg.get("lease_seconds", 60))
+    except (TypeError, ValueError):
+        lease_seconds = 60                      # 非法回退默认（§21.1）
+    INPUT_LEASE_SECONDS = max(5, lease_seconds)   # 下限 5（§21.1）
+
+    elevated = cfg.get("elevated")
+    if (isinstance(elevated, dict) and isinstance(elevated.get("task_name"), str)
+            and elevated.get("task_name")):
+        ELEVATED_TASK_NAME = elevated["task_name"]
+    else:
+        ELEVATED_TASK_NAME = None
+
+    if changed:
+        try:
+            atomic_write_json(config_file, cfg)
+        except OSError as exc:
+            sys.stderr.write("[警告] S3 配置键（device_id/update）写回失败：%s\n" % exc)
+
+
+def update_enroll():
+    """更新签名密钥建立/轮换（契约 §20.1）：每次调用生成新 64hex hmac_key，
+    同步内存与配置文件并返回。旧密钥随即失效。持久化失败抛异常（→ 500）。"""
+    global UPDATE_HMAC_KEY
+    key = os.urandom(32).hex()
+    with UPDATE_LOCK:
+        UPDATE_HMAC_KEY = key
+
+    def mutator(cfg):
+        update_cfg = cfg.get("update") if isinstance(cfg.get("update"), dict) else {}
+        cfg["update"] = update_cfg
+        update_cfg["hmac_key"] = key
+
+    persist_config(mutator)
+    return key
+
+
+def update_pin_add(sha256_value):
+    """可信哈希白名单追加（契约 §20.2）：去重、上限 16（超限拒绝）。
+    返回 (ok, 拒绝消息)；成功时同步持久化 node.json。"""
+    with UPDATE_LOCK:
+        if sha256_value in TRUSTED_HASHES:
+            return True, None                    # 去重：已在白名单中视为成功
+        if len(TRUSTED_HASHES) >= MAX_TRUSTED_HASHES:
+            return False, "trusted_hashes 已达上限 %d，无法追加" % MAX_TRUSTED_HASHES
+        TRUSTED_HASHES.append(sha256_value)
+
+    def mutator(cfg):
+        update_cfg = cfg.get("update") if isinstance(cfg.get("update"), dict) else {}
+        cfg["update"] = update_cfg
+        update_cfg["trusted_hashes"] = list(TRUSTED_HASHES)
+
+    persist_config(mutator)
+    return True, None
 
 
 # --------------------------------------------------------------------------
@@ -1762,6 +2056,259 @@ def query_audit(query):
 
 
 # --------------------------------------------------------------------------
+# 输入租约（契约 §21，D21/FR-06/FR-12）
+# --------------------------------------------------------------------------
+
+INPUT_LEASE_ACTIONS = ("acquire", "renew", "release", "take")   # §21.2 请求头合法值
+
+
+def _lease_lazy_expire_locked():
+    """过期惰性判定（§21.1，需持锁）：now > expires_at 即视为空闲；无后台线程。"""
+    lease = INPUT_LEASE
+    if (lease["holder"] is not None and lease["expires_at"] is not None
+            and time.time() > lease["expires_at"]):
+        lease["holder"] = None
+        lease["acquired_at"] = None
+        lease["expires_at"] = None
+
+
+def input_lease_snapshot(identity):
+    """当前租约快照（§21.3）：{holder, mine, expires_at}，含惰性过期判定。"""
+    with INPUT_LEASE_LOCK:
+        _lease_lazy_expire_locked()
+        lease = INPUT_LEASE
+        return {"holder": lease["holder"],
+                "mine": lease["holder"] == identity,
+                "expires_at": lease["expires_at"]}
+
+
+def input_lease_check(identity, mode):
+    """输入租约判定（契约 §21.2 语义表，冻结）。
+
+    mode：None（无头 = 隐式 acquire）或 acquire/renew/release/take（合法性由调用方先行校验）。
+    判定顺序：被抢占标记 → 租约判定 → 通过后由调用方执行动作（§21.2）。
+
+    返回 (verdict, payload)：
+        ("allow", None)                 通过（租约快照由调用方事后经 snapshot 取得）
+        ("deny409", 消息)               → 409 INPUT_LEASE_TAKEN
+        ("deny400", 消息)               → 400 BAD_REQUEST
+    """
+    now = time.time()
+    with INPUT_LEASE_LOCK:
+        # ① 被抢占标记（D21）：被抢占身份的下一次任何 /v1/input 请求 → 409
+        #    （不执行动作），处理后清除一次性标记；再下一次恢复正常判定。
+        if identity in INPUT_LEASE_PREEMPTED:
+            INPUT_LEASE_PREEMPTED.discard(identity)
+            return "deny409", "输入租约已被其他控制端抢占（下一次请求恢复正常）"
+        _lease_lazy_expire_locked()
+        lease = INPUT_LEASE
+        holder = lease["holder"]
+        mine = holder == identity
+
+        if mode == "renew":
+            # 本人持有 → 续至 now+lease 并执行；空闲/过期/他人持有 → 409
+            if not mine:
+                return "deny409", "租约续期失败：租约未被本人持有"
+            lease["expires_at"] = now + INPUT_LEASE_SECONDS
+        elif mode == "release":
+            # 本人持有 → 释放（清空租约）并执行动作（actions 可空）；
+            # 他人持有或无租约 → 400 BAD_REQUEST
+            if not mine:
+                return "deny400", "租约释放失败：租约未被本人持有"
+            lease["holder"] = None
+            lease["acquired_at"] = None
+            lease["expires_at"] = None
+        elif mode == "take":
+            # 显式抢占：空闲 → 直接授予；本人持有 → 续期（并清除自身被抢占标记，如有）；
+            # 他人持有 → 立即改持有人为请求者，原持有人写入被抢占标记（D21）
+            if holder is not None and not mine:
+                INPUT_LEASE_PREEMPTED.add(holder)
+            lease["holder"] = identity
+            lease["acquired_at"] = now
+            lease["expires_at"] = now + INPUT_LEASE_SECONDS
+            INPUT_LEASE_PREEMPTED.discard(identity)
+        else:
+            # 无头（隐式 acquire）/ acquire：空闲或过期 → 授予并执行；
+            # 本人持有 → 执行并续至 now+lease（FR-12"60 秒自动续期"口径）；
+            # 他人持有未过期 → 409 INPUT_LEASE_TAKEN（不执行动作）
+            if holder is not None and not mine:
+                return "deny409", ("输入租约被他人持有：%s"
+                                   "（可用 X-Input-Lease: take 显式抢占）" % holder)
+            lease["holder"] = identity
+            lease["acquired_at"] = now
+            lease["expires_at"] = now + INPUT_LEASE_SECONDS
+        return "allow", None
+
+
+# --------------------------------------------------------------------------
+# 高权限驻留（契约 §22，B18/D12/D22）
+# --------------------------------------------------------------------------
+
+SEE_MASK_NOCLOSEPROCESS = 0x00000040
+SW_HIDE = 0
+WAIT_TIMEOUT_WIN32 = 0x00000102
+ERROR_CANCELLED = 1223                # UAC 弹窗被用户取消
+ELEVATE_TASK_NAME_RE = r"[A-Za-z0-9_\-\. ]{1,64}"
+
+shell32.ShellExecuteExW.restype = wintypes.BOOL
+kernel32.WaitForSingleObject.argtypes = [HANDLE, wintypes.DWORD]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
+kernel32.GetExitCodeProcess.argtypes = [HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+kernel32.TerminateProcess.argtypes = [HANDLE, wintypes.UINT]
+kernel32.TerminateProcess.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [HANDLE]
+kernel32.CloseHandle.restype = wintypes.BOOL
+
+
+class SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HINSTANCE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", ctypes.c_void_p),
+        ("dwHotKey", wintypes.DWORD),
+        ("hIconOrMonitor", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+
+shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+
+
+def build_schtasks_create_args(task_name, python_exe, node_path, config_path, port):
+    """计划任务创建命令构造 helper（契约 §22.1，独立可调用，供冒烟白盒校验）。
+
+    返回完整 schtasks 参数列表（含 "schtasks" 前缀）：
+        schtasks /create /tn <名> /sc onlogon /rl highest /f
+                /tr "\"<python>\" \"<node.py>\" --config <配置路径> --port <端口>"
+    /tr 值内的引号结构由 subprocess.list2cmdline 编码为契约所示形态。
+    """
+    tr_value = '"%s" "%s" --config %s --port %d' % (python_exe, node_path,
+                                                    config_path, int(port))
+    return ["schtasks", "/create", "/tn", task_name, "/sc", "onlogon",
+            "/rl", "highest", "/f", "/tr", tr_value]
+
+
+def elevate_runexe(file, params, timeout=30):
+    """提权运行 helper（契约 §22.1，独立可调用，供冒烟白盒验证错误映射）。
+
+    ShellExecuteExW + SEE_MASK_NOCLOSEPROCESS + verb="runas" + SW_HIDE，
+    等待进程退出（超时 timeout 秒，超时终止子进程）。
+    返回 (exit_code, 错误信息)：成功 (0, None)；失败/取消/超时返回非零与中文错误。
+    """
+    # 文件存在性预检：ShellExecuteExW 对不存在的文件同样可能走 UAC 同意流程并
+    # 返回 ERROR_CANCELLED，语义错位（实测）且会闪现弹窗；先拦下给出明确错误
+    if not os.path.isfile(file):
+        return -1, "提权启动失败：文件不存在（%s）" % file
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS
+    sei.hwnd = None
+    sei.lpVerb = "runas"
+    sei.lpFile = file
+    sei.lpParameters = params if params else None
+    sei.lpDirectory = None
+    sei.nShow = SW_HIDE
+    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+        err_code = ctypes.get_last_error()
+        if err_code == ERROR_CANCELLED:
+            return -1, "用户拒绝 UAC 提权"
+        return -1, "提权启动失败（WinError %s）：%s" % (
+            err_code, os.strerror(err_code) if err_code else "未知错误")
+    hproc = sei.hProcess
+    if not hproc:
+        return -1, "提权启动失败：未获得子进程句柄"
+    try:
+        waited = kernel32.WaitForSingleObject(hproc, int(timeout * 1000))
+        if waited == WAIT_TIMEOUT_WIN32:
+            kernel32.TerminateProcess(hproc, 1)
+            return -1, "提权确认超时（%d 秒）" % int(timeout)
+        exit_code = wintypes.DWORD(0)
+        if not kernel32.GetExitCodeProcess(hproc, ctypes.byref(exit_code)):
+            return -1, "提权子进程退出码获取失败（WinError %d）" % ctypes.get_last_error()
+        if exit_code.value != 0:
+            return exit_code.value, "提权子进程异常退出（退出码 %s）" % exit_code.value
+        return 0, None
+    finally:
+        kernel32.CloseHandle(hproc)
+
+
+def elevate_task_cli(task_name, install, port=None, config_path=None):
+    """--elevate-task-install / --elevate-task-remove 子命令（契约 §22.1）：
+    进程本身已被提权（由 elevate/install 经 runas 拉起），直接执行对应 schtasks 命令、
+    打印结果，以 schtasks 退出码退出；不进入 HTTP 服务。"""
+    if config_path is None:
+        config_path = CONFIG_FILE or default_config_path()
+    if port is None:
+        port = ACTUAL_PORT or DEFAULT_PORT
+    if install:
+        argv = build_schtasks_create_args(task_name, sys.executable,
+                                          os.path.abspath(__file__),
+                                          config_path, port)
+    else:
+        argv = ["schtasks", "/delete", "/tn", task_name, "/f"]
+    try:
+        proc = subprocess.run(argv, capture_output=True)
+    except OSError as exc:
+        sys.stderr.write("schtasks 执行失败：%s\n" % exc)
+        return 1
+    out = _decode(proc.stdout).strip()
+    err = _decode(proc.stderr).strip()
+    if out:
+        print(out)
+    if err:
+        sys.stderr.write(err + "\n")
+    print("计划任务%s%s（退出码 %d）" % ("创建" if install else "删除",
+          "成功" if proc.returncode == 0 else "失败", proc.returncode))
+    return proc.returncode
+
+
+def elevate_install(task_name):
+    """实现 POST /v1/elevate/install 的落盘与内存同步（§22.1，UAC 交互由端点层完成）：
+    复核通过后原子写 node.json elevated 标记并同步内存全局。"""
+    global ELEVATED_TASK_NAME
+
+    def mutator(cfg):
+        cfg["elevated"] = {"task_name": task_name}
+
+    persist_config(mutator)
+    ELEVATED_TASK_NAME = task_name
+
+
+def elevate_remove_mark():
+    """实现 POST /v1/elevate/remove 的标记清除（§22.1，幂等）：清内存与 node.json。"""
+    global ELEVATED_TASK_NAME
+
+    def mutator(cfg):
+        cfg.pop("elevated", None)
+
+    try:
+        persist_config(mutator)
+    except OSError as exc:
+        sys.stderr.write("[警告] elevated 标记清除失败：%s\n" % exc)   # 仅告警（§22.1）
+    ELEVATED_TASK_NAME = None
+
+
+def schtasks_query(task_name):
+    """schtasks /query /tn <名> 复核任务是否存在；存在返回 True。"""
+    try:
+        proc = subprocess.run(["schtasks", "/query", "/tn", task_name],
+                              capture_output=True, creationflags=CREATE_NO_WINDOW)
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
+# --------------------------------------------------------------------------
 # HTTP 服务
 # --------------------------------------------------------------------------
 
@@ -1791,6 +2338,8 @@ KNOWN_POST_PATHS = frozenset({
     "/v1/fs/delete", "/v1/fs/mkdir", "/v1/fs/move",
     "/v1/fs/upload/begin", "/v1/fs/upload/chunk",
     "/v1/fs/upload/commit", "/v1/fs/upload/abort",
+    "/v1/update/enroll", "/v1/update/pin",                  # S3 新增（§20）
+    "/v1/elevate/install", "/v1/elevate/remove",            # S3 新增（§22）
 })
 
 
@@ -1859,9 +2408,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def audit(self, parsed, identity, result, code):
         """写一条审计（§8）。调用方保证已通过来源校验。"""
-        # §8.2：校验失败（401/409/400，含业务 400 与来源 403）target 置空；
-        # 唯一例外是业务 403（SANDBOX_DENIED 白名单越界）——target 照常记录（可追溯）
-        if result in (400, 401, 409) or (result == 403 and code != "SANDBOX_DENIED"):
+        # §8.2：校验失败（401/409/400，含业务 400 与来源 403）target 置空；例外（照常记录，
+        # 已鉴权主体的可追溯行为）：
+        #   - 业务 403（SANDBOX_DENIED 白名单越界）（S2）
+        #   - 409 INPUT_LEASE_TAKEN（输入冲突/被抢占）与 400 UPDATE_REJECTED（更新包被拒）（S3）
+        clear = (result in (400, 401, 409)
+                 or (result == 403 and code != "SANDBOX_DENIED"))
+        keep = ((result == 403 and code == "SANDBOX_DENIED")
+                or (result == 409 and code == "INPUT_LEASE_TAKEN")
+                or (result == 400 and code == "UPDATE_REJECTED"))
+        if clear and not keep:
             target = ""
         else:
             target = sanitize_secret(self._audit_target)
@@ -1969,7 +2525,10 @@ class Handler(BaseHTTPRequestHandler):
         query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
 
         if path in ("/", "/v1/health"):
-            self.ok({"status": "up", "node_version": NODE_VERSION})
+            # S3 新增 rollback_flag（§6.1/§20.4）：node.py 同目录存在 rollback.flag
+            # → true（看门狗曾回滚、需人工处置），每次请求实时判断文件存在性
+            self.ok({"status": "up", "node_version": NODE_VERSION,
+                     "rollback_flag": rollback_flag_exists()})
             return
 
         if path == "/v1/info":
@@ -2195,6 +2754,22 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(actions, list):
                 self.set_target("actions=" + ",".join(
                     a.get("type", "") if isinstance(a, dict) else "" for a in actions))
+            # ---- S3 输入租约（契约 §21.2）：判定先于动作执行与锁屏/交互检查 ----
+            # 请求头 X-Input-Lease: acquire|renew|release|take（值非法 → 400）；
+            # 无头 = 隐式 acquire（偏差 10：兼容 S1/S2 无头客户端）。空 actions 合法
+            # （供 xd release 释放租约使用）。409 INPUT_LEASE_TAKEN 不执行动作。
+            lease_mode = self.headers.get("X-Input-Lease")
+            if lease_mode is not None and lease_mode not in INPUT_LEASE_ACTIONS:
+                self.fail("BAD_REQUEST",
+                          "X-Input-Lease 头非法（acquire/renew/release/take）", 400)
+                return
+            verdict, message = input_lease_check(self._identity, lease_mode)
+            if verdict == "deny409":
+                self.fail("INPUT_LEASE_TAKEN", message, 409)
+                return
+            if verdict == "deny400":
+                self.fail("BAD_REQUEST", message, 400)
+                return
             results = []
             for action in body.get("actions", []):
                 kind = action.get("type")
@@ -2220,6 +2795,8 @@ class Handler(BaseHTTPRequestHandler):
                 "sent": results,
                 "interactive": state["interactive"],
                 "locked": state["locked"],
+                # S3 新增（§6.7/§21.3）：处理完成后的租约状态快照
+                "lease": input_lease_snapshot(self._identity),
             })
             return
 
@@ -2413,17 +2990,135 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/self-update":
+            # S3 签名升级（契约 §6.8/§20.2）：请求体 {"source_b64","sha256","hmac"}，
+            # 校验顺序 sha256 → hmac → trusted_hashes 白名单，任一失败 → 400
+            # UPDATE_REJECTED 且不落盘；旧格式缺 sha256/hmac → 400 UPDATE_REJECTED
+            # （E-02 唯一兼容例外，偏差 9）。审计 target=bytes=<N>，缺 source_b64/
+            # 未解码记 bytes=0（§8.3）。
             body = self.read_body()
-            raw = base64.b64decode(body["source_b64"])
+            self.set_target("bytes=0")
+            source_b64 = body.get("source_b64")
+            if not isinstance(source_b64, str) or not source_b64:
+                self.fail("BAD_REQUEST", "缺少 source_b64", 400)
+                return
             try:
-                result = self_update(raw)
+                raw = base64.b64decode(source_b64)
+            except Exception:
+                self.fail("BAD_REQUEST", "source_b64 解码失败", 400)
+                return
+            self.set_target("bytes=%d" % len(raw))
+            reject = update_signature_verify(raw, body.get("sha256"), body.get("hmac"))
+            if reject is not None:
+                self.fail("UPDATE_REJECTED", reject, 400)
+                return
+            try:
+                result = self_update(raw, ACTUAL_PORT)
             except ValueError as exc:
-                # 语法校验失败返回 400（契约 §6.8）
+                # 语法校验失败返回 400（契约 §6.8，"源码语法错误"文案维持现状）
                 self.fail("BAD_REQUEST", str(exc), 400)
                 return
-            self.set_target("bytes=%d" % result["bytes"])
             self.ok(result)
             threading.Timer(0.4, lambda: os._exit(0)).start()
+            return
+
+        if path == "/v1/update/enroll":
+            # S3 新增（契约 §20.1）：每次调用生成新 hmac_key、持久化并返回（轮换，
+            # 旧密钥随即失效）。审计 target 恒为空字符串——hmac_key 永不落审计/日志/横幅。
+            key = update_enroll()
+            self.ok({"hmac_key": key})
+            return
+
+        if path == "/v1/update/pin":
+            # S3 新增（契约 §20.2）：请求体 {"sha256": <64hex 小写>} → 追加
+            # trusted_hashes（去重、上限 16、超限 → 400）。
+            body = self.read_body()
+            sha_value = body.get("sha256")
+            if not isinstance(sha_value, str) or not re.fullmatch(r"[0-9a-f]{64}",
+                                                                  sha_value):
+                self.fail("BAD_REQUEST", "sha256 必须是 64 位小写十六进制", 400)
+                return
+            self.set_target("sha256=%s" % sha_value)
+            added, reject = update_pin_add(sha_value)
+            if not added:
+                self.fail("BAD_REQUEST", reject, 400)
+                return
+            self.ok({"added": True, "trusted_hashes": list(TRUSTED_HASHES)})
+            return
+
+        if path == "/v1/elevate/install":
+            # S3 新增（契约 §22.1）：经 ShellExecuteW runas 提权运行自身提权子命令，
+            # 由子进程执行 schtasks /create（登录触发 + 最高权限）；UAC 拒绝/超时/
+            # 子进程失败 → 500 INTERNAL 明确中文错误，不写 elevated 标记。
+            body = self.read_body()
+            task_name = body.get("task_name")
+            if task_name is None:
+                task_name = DEFAULT_ELEVATE_TASK
+            self.set_target("task=%s" % task_name)
+            if (not isinstance(task_name, str)
+                    or not re.fullmatch(ELEVATE_TASK_NAME_RE, task_name)):
+                self.fail("BAD_REQUEST",
+                          "task_name 非法（限 [A-Za-z0-9_\\-\\. ]{1,64} 字符）", 400)
+                return
+            params = subprocess.list2cmdline([
+                os.path.abspath(__file__),
+                "--elevate-task-install", task_name,
+                "--config", CONFIG_FILE,
+                "--port", str(ACTUAL_PORT),
+            ])
+            exit_code, err = elevate_runexe(sys.executable, params, timeout=30)
+            if exit_code != 0:
+                if err:
+                    self.fail("INTERNAL", err, 500)   # UAC 拒绝/超时/启动失败明确报错
+                else:
+                    self.fail("INTERNAL",
+                              "计划任务创建失败：提权子进程退出码 %s" % exit_code, 500)
+                return
+            if not schtasks_query(task_name):
+                self.fail("INTERNAL",
+                          "计划任务创建失败：schtasks /query 复核未找到任务 %s" % task_name,
+                          500)
+                return
+            try:
+                elevate_install(task_name)
+            except OSError as exc:
+                self.fail("INTERNAL", "elevated 标记写入失败：%s" % exc, 500)
+                return
+            self.ok({"installed": True, "task_name": task_name})
+            return
+
+        if path == "/v1/elevate/remove":
+            # S3 新增（契约 §22.1）：schtasks /delete（当前权限直接执行，不经提权）；
+            # 任务不存在视为已清理（幂等）；其他失败 → 500 INTERNAL（提示手动清理）。
+            body = self.read_body()
+            task_name = body.get("task_name")
+            if task_name is None:
+                task_name = ELEVATED_TASK_NAME
+            self.set_target("task=%s" % (task_name if isinstance(task_name, str)
+                                         else ""))
+            if (not isinstance(task_name, str) or not task_name
+                    or not re.fullmatch(ELEVATE_TASK_NAME_RE, task_name)):
+                self.fail("BAD_REQUEST",
+                          "task_name 非法或缺失（节点亦无高权限驻留标记可取）", 400)
+                return
+            if schtasks_query(task_name):
+                try:
+                    proc = subprocess.run(["schtasks", "/delete", "/tn", task_name, "/f"],
+                                          capture_output=True,
+                                          creationflags=CREATE_NO_WINDOW)
+                except OSError as exc:
+                    self.fail("INTERNAL", "删除计划任务失败：%s" % exc, 500)
+                    return
+                if proc.returncode != 0:
+                    summary = (_decode(proc.stderr).strip()
+                               or _decode(proc.stdout).strip())[:200]
+                    self.fail("INTERNAL",
+                              "删除计划任务失败：%s（可手动执行 schtasks /delete /tn %s /f 清理）"
+                              % (summary or ("退出码 %d" % proc.returncode), task_name),
+                              500)
+                    return
+            # 任务不存在（query 未命中）视为已清理，同样清除标记并成功返回（幂等）
+            elevate_remove_mark()
+            self.ok({"removed": True, "task_name": task_name})
             return
 
         self.fail("NOT_FOUND", "未知接口：%s" % path, 404)
@@ -2452,6 +3147,93 @@ def local_addresses():
     except Exception:
         pass
     return [ip for ip in found if is_private(ip)]
+
+
+# --------------------------------------------------------------------------
+# 发现广播发送（契约 §19.1，B12/D25/D38；node 只发送、不监听 51889）
+# --------------------------------------------------------------------------
+
+def build_broadcast_frame(port, device_id=None, hostname=None, ts=None):
+    """构造 XDCAST 广播帧（契约 §19.1；帧构造与发送分离，便于白盒调用）。
+
+    报文：JSON UTF-8 单行 ≤ 512 字节，字段 = magic/proto/device_id/hostname/
+    port/version/caps/ts。序列化超 512 字节 → stderr 告警并返回 None
+    （不截断，避免解析歧义）。
+    """
+    frame = {
+        "magic": "XDCAST",
+        "proto": 1,
+        "device_id": device_id if device_id is not None else DEVICE_ID,
+        "hostname": hostname if hostname is not None else socket.gethostname(),
+        "port": int(port),
+        "version": NODE_VERSION,
+        "caps": list(BROADCAST_CAPS),
+        "ts": ts if ts is not None else time.time(),
+    }
+    try:
+        data = json.dumps(frame, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        sys.stderr.write("[警告] 广播帧序列化失败：%s\n" % exc)
+        return None
+    if len(data) > BROADCAST_MAX_BYTES:
+        sys.stderr.write("[警告] 广播帧 %d 字节超过上限 %d，跳过本帧（不截断）\n"
+                         % (len(data), BROADCAST_MAX_BYTES))
+        return None
+    return data
+
+
+def broadcast_targets():
+    """发送目标（契约 §19.1）：受限广播 255.255.255.255 + 本机每个私网 IPv4 的
+    /24 定向广播（a.b.c.255，复用 local_addresses() 口径）+ 回环定向广播
+    127.255.255.255（供同机控制端接收）。去重保序。"""
+    targets = ["255.255.255.255"]
+    for ip in local_addresses():
+        parts = ip.split(".")
+        if len(parts) == 4:
+            targets.append("%s.%s.%s.255" % (parts[0], parts[1], parts[2]))
+    targets.append("127.255.255.255")
+    seen = set()
+    ordered = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            ordered.append(t)
+    return ordered
+
+
+def send_broadcast_frame(frame, targets, sock=None):
+    """逐目标发送一帧广播（契约 §19.1）：socket 设 SO_BROADCAST、不绑定固定端口
+    （源端口随机）；单目标失败（如无广播路由）仅 stderr 告警，不影响其余目标与服务。
+    返回成功发送的目标数；frame 为 None（超限/序列化失败）时不发送。
+    """
+    if frame is None:
+        return 0
+    own_sock = sock is None
+    if own_sock:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            pass                    # 极老系统不支持时保持默认语义
+    sent = 0
+    for target in targets:
+        try:
+            sock.sendto(frame, (target, BROADCAST_PORT))
+            sent += 1
+        except OSError as exc:
+            sys.stderr.write("[警告] 广播发送失败（%s:%d）：%s\n"
+                             % (target, BROADCAST_PORT, exc))
+    if own_sock:
+        sock.close()
+    return sent
+
+
+def broadcast_loop(port):
+    """广播心跳线程（契约 §19.1，D25）：启动即发 1 帧 + 每 10 秒 1 帧；
+    daemon 线程，node 退出即停。目标地址每轮重算（兼容 DHCP 地址漂移）。"""
+    while True:
+        send_broadcast_frame(build_broadcast_frame(port), broadcast_targets())
+        time.sleep(BROADCAST_INTERVAL)
 
 
 def _port_has_listener(host, port):
@@ -2495,6 +3277,7 @@ def _bind_attempt(host, port, ssl_context):
 def main():
     global VERBOSE, IDENTITIES, TOKEN
     global TLS_ENABLED, TLS_PLAINTEXT_DEBUG, CERT_FINGERPRINT, UPLOADS_MANIFEST
+    global CONFIG_FILE, ACTUAL_PORT
     parser = argparse.ArgumentParser(description="CrossDevice 执行器")
     parser.add_argument("--port", type=int, default=None,
                         help="期望端口（优先级：CLI > node.json 的 port 字段 > 51888；"
@@ -2516,9 +3299,28 @@ def main():
                              "上传清单按实例隔离，TLS 目录共享；与 --config 互斥，契约 §16.2）")
     parser.add_argument("--debug-plaintext", action="store_true",
                         help="调试：主监听端口改以明文 HTTP 服务（默认关闭，D31）")
+    parser.add_argument("--elevate-task-install", default=None, metavar="名",
+                        help="提权子命令（契约 §22.1）：由 /v1/elevate/install 以 runas "
+                             "拉起，直接执行 schtasks /create 后按退出码退出，不进 HTTP 服务")
+    parser.add_argument("--elevate-task-remove", default=None, metavar="名",
+                        help="提权子命令（契约 §22.1）：直接执行 schtasks /delete 后按退出码退出")
     args = parser.parse_args()
 
     VERBOSE = args.verbose
+
+    # ---- 提权子命令（契约 §22.1）：进程本身已被提权（runas 拉起），直接执行
+    # schtasks 并以其退出码退出，不进入 HTTP 服务 ----
+    if args.elevate_task_install or args.elevate_task_remove:
+        install = args.elevate_task_install is not None
+        sub_task_name = args.elevate_task_install or args.elevate_task_remove
+        if not re.fullmatch(ELEVATE_TASK_NAME_RE, sub_task_name):
+            sys.stderr.write("task_name 非法：%s（限 [A-Za-z0-9_\\-\\. ]{1,64}）\n"
+                             % sub_task_name)
+            raise SystemExit(2)
+        raise SystemExit(elevate_task_cli(
+            sub_task_name, install,
+            port=args.port,
+            config_path=args.config or default_config_path()))
 
     # ---- 多实例与配置文件路径（契约 §16.2）----
     instance_name = None
@@ -2537,6 +3339,11 @@ def main():
     TOKEN = next((i["token"] for i in identities if i["name"] == DEFAULT_IDENTITY_NAME),
                  identities[0]["token"] if identities else "")
     base_dir = os.path.dirname(os.path.abspath(config_file))
+
+    # ---- S3 新键初始化（契约 §9.1/§19.1/§20.1/§21.1/§22）：device_id 与
+    # update.hmac_key 缺失则生成并原子写回；lease_seconds / elevated 读入内存 ----
+    CONFIG_FILE = os.path.abspath(config_file)
+    ensure_s3_config(cfg, CONFIG_FILE)
 
     # ---- 审计（契约 §8.1；--instance 时为 audit-<名>/，实例隔离 §16.2）----
     audit_subdir = ("audit-%s" % instance_name) if instance_name else "audit"
@@ -2613,6 +3420,7 @@ def main():
         print("可改用 --port <端口> 手动指定端口后重试。")
         raise SystemExit(1)
     server.daemon_threads = True
+    ACTUAL_PORT = actual_port
 
     # ---- 端口持久化（契约 §16.1/D35）：把实际端口写回配置文件供下次启动优先复用 ----
     if cfg.get("port") != actual_port:
@@ -2621,6 +3429,10 @@ def main():
             atomic_write_json(config_file, cfg)
         except Exception as exc:
             sys.stderr.write("[警告] 端口持久化失败：%s\n" % exc)
+
+    # ---- 发现广播（契约 §19.1）：端口绑定成功后才启动，port 为实际绑定端口；
+    # 启动即发 1 帧 + 每 10 秒 1 帧（D25），daemon 线程随进程退出停止 ----
+    threading.Thread(target=broadcast_loop, args=(actual_port,), daemon=True).start()
 
     # ---- 启动横幅（契约 §7.1/§16.3：保留既有行，端口用实际绑定值，新增实例行）----
     line = "=" * 62
@@ -2646,6 +3458,9 @@ def main():
     for ip in local_addresses():
         print(" 访问地址  : %s://%s:%d" % (scheme, ip, actual_port))
     print(" 实例      : %s" % (instance_name or "default"))
+    # S3 新增（契约 §7.1/§22.2）：高权限驻留标注；降级运行（未驻留）为正常状态，仅标注不告警
+    print(" 驻留      : %s" % ("是（计划任务 %s）" % ELEVATED_TASK_NAME
+                              if ELEVATED_TASK_NAME else "否"))
     print(line)
     if TLS_PLAINTEXT_DEBUG:
         print(" 警告：明文调试模式已开启（--debug-plaintext），传输不加密，")
