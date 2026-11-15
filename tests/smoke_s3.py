@@ -599,11 +599,14 @@ def c3_broadcast(ctx, opts):
 
 
 def c4_flood_no_trust(ctx, opts):
-    """C4 限频去重与不信任：先启动 pool 采样（UDP 无连接缓冲，帧必须落在采样窗内），
-    向 51889 手工洪泛同一 (源IP, device_id) 伪造帧（20 帧）→ pool 快照该伪造
-    device_id 的 frames ≤2（每秒 1 帧限频生效，未洪泛入库）；广播接收全程注册表
-    （临时 registry）无新增条目、port/hmac_key/指纹无变化（D38 不自动信任）。
-    本项为 xd 侧语义，不依赖 node v0.4.0。"""
+    """C4 回环帧丢弃与不信任（B45 修订，原「限频去重」口径下沉 pytest）：
+    先启动 pool 采样（UDP 无连接缓冲，帧必须落在采样窗内），向 51889 手工
+    洪泛同一 (127.0.0.1, device_id) 伪造帧（20 帧）→ pool 快照该伪造 device_id
+    的 frames == 0（B45：回环来源帧在 accept 层直接丢弃——同机实例不入
+    「发现的设备」池，「跑门槛前退出 a4agent」口径代码化；限频逻辑的黑盒
+    覆盖下沉至 a4agent pytest test_pool_rate_limit_*，且回环洪泛已无入库
+    可能）；广播接收全程注册表（临时 registry）无新增条目、port/hmac_key/
+    指纹无变化（D38 不自动信任）。本项为 xd 侧语义，不依赖 node v0.4.0。"""
     notes = []
     device_id = "f00dc0ffee12"                 # 伪造 device_id（与真实广播可区分）
     reg_before = xd.load_registry()
@@ -650,9 +653,9 @@ def c4_flood_no_trust(ctx, opts):
     rc = proc.returncode
     entry = ((snap or {}).get("devices") or {}).get(device_id) or {}
     frames = entry.get("frames", 0)
-    ok_rate = 1 <= frames <= 2                  # 20 帧洪泛 → 限频后仅 1–2 帧入库
-    notes.append("pool 10s 快照：伪造 device_id 帧数=%s（1≤frames≤2 即限频生效；"
-                 "无限频时应≈20）count=%s rc=%s"
+    ok_rate = frames == 0                       # B45：回环来源帧直接丢弃 → 0 帧入库
+    notes.append("pool 10s 快照：伪造 device_id 帧数=%s（B45 回环丢弃：恒 0；"
+                 "B45 前限频口径应为 1–2 帧）count=%s rc=%s"
                  % (frames, (snap or {}).get("count"), rc))
 
     # ④ 注册表全程不变（D38：广播来源不自动信任、不自动 add）
@@ -1319,7 +1322,7 @@ def main():
             ("C1", "签名更新", c1_signed_update),
             ("C2", "看门狗回滚", c2_watchdog_rollback),
             ("C3", "广播上线", c3_broadcast),
-            ("C4", "限频与不信任", c4_flood_no_trust),
+            ("C4", "回环帧丢弃与不信任", c4_flood_no_trust),
             ("C5", "端口同步", c5_port_sync),
             ("C6", "输入租约", c6_input_lease),
             ("C7", "高权限驻留", c7_elevate),
