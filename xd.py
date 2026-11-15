@@ -33,11 +33,23 @@ S3 韧性与并发（契约 V1.3，§19/§20/§21/§22）：
   - 新增 `elevate`（高权限驻留计划任务安装/移除，契约 22）；
   - 注册表条目写回补齐 `hmac_key`（S3 第五键，契约 9.2）；
   - request() 新增可选 extra_headers 参数（既有调用不受影响）。
+M6 攒批（B17 宏录制与回放，D9/D30，契约 V1.7 §11 兼容清单增量，协议零变更）：
+  - 新增 `macro rec` / `macro run` 子命令：宏 = 白名单动作序列 JSON（与 /v1/input
+    actions 同构），仅在控制端本地解析与严格校验（D30 红线：不支持循环/条件/
+    变量/表达式/外部命令，不允许任意脚本；加载校验失败即整体拒绝）；宏文件格式
+    规范正文见 README"宏（macro rec/run）"节；
+  - 回放：按 delay 分段经既有 /v1/input 发送，全程持输入租约（首段 acquire、
+    其后无头=隐式续期，§21.2），Ctrl+C 或异常中断即 best-effort release
+    （FR-06），正常结束亦释放；不新增端点、不改 node、不改包络；
+  - 录制：Windows 低级键鼠钩子（WH_MOUSE_LL/WH_KEYBOARD_LL，纯标准库 ctypes）
+    捕获控制端本机操作（纯本地命令，不触网络、不写被控端），移动去抖/双击与
+    打字聚合/间隔写 delay_ms，产物经同一套加载校验后写盘。
 既有子命令的输出格式与语义保持不变（E-02，兼容清单第 11 章）。
 """
 
 import argparse
 import base64
+import ctypes
 import hashlib
 import hmac
 import http.client
@@ -53,6 +65,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+from ctypes import wintypes
 from pathlib import Path
 
 import discover
@@ -1667,6 +1680,649 @@ def cmd_cert(args, registry):
 
 
 # --------------------------------------------------------------------------
+# M6 新增：宏录制与回放（B17/D9/D30，契约 §11 V1.7 兼容清单行，协议零变更）。
+# 宏 = 白名单动作序列 JSON（动作与 /v1/input actions 同构，契约 §6.7），只在
+# 控制端本地解析与校验，不进入 node 执行面；加载校验失败即整体拒绝、不执行任何
+# 动作。D30 红线：不支持循环/条件/变量/表达式/外部命令，不允许任意脚本。
+# 回放：按 delay 分段经既有 /v1/input 发送，全程持输入租约（§21.2），中断即释放
+# （FR-06）。录制：Windows 低级键鼠钩子（纯标准库 ctypes）捕获控制端本机操作，
+# 纯本地命令，不触网络、不写被控端。宏文件格式规范正文见 README"宏（macro rec/run）"节。
+# --------------------------------------------------------------------------
+
+MACRO_VERSION = 1
+MACRO_ACTION_TYPES = ("click", "doubleclick", "move", "wheel", "type", "key")
+MACRO_BUTTONS = ("left", "right", "middle")
+MACRO_XY_MAX = 100000            # x/y 宽松护栏（防误填超大值；非桌面物理边界）
+MACRO_DELAY_MAX_MS = 600000      # 单个 delay_ms 上限（10 分钟）
+MACRO_WHEEL_MAX = 100000         # wheel delta 绝对值护栏
+MACRO_TEXT_MAX = 10000           # type text 字符数护栏
+MACRO_KEY_MAX = 64               # key 组合串长度护栏
+MACRO_ACTIONS_MAX = 10000        # 动作条数护栏
+MACRO_SPEED_MIN = 0.01           # --speed 护栏下限
+MACRO_SPEED_MAX = 100.0          # --speed 护栏上限
+
+# 录制去抖与聚合阈值（README"宏（macro rec/run）"节如实登记）
+MACRO_REC_MOVE_MIN_PX = 8        # 移动采样：距上次采样点位移阈值（像素）
+MACRO_REC_MOVE_MAX_GAP_MS = 300  # 移动采样：距上次保留事件的时间阈值（缓慢拖动仍采样）
+MACRO_REC_DOUBLE_MS = 500        # 双击聚合窗口（对齐 Windows 默认双击时长）
+MACRO_REC_DOUBLE_PX = 8          # 双击聚合允许的最大位移（像素）
+MACRO_REC_TEXT_SPLIT_MS = 1500   # 打字聚合：间隔超过即拆分为新的 type 动作
+
+# Windows 低级钩子常量（录制专用，纯标准库 ctypes；回调签名 LRESULT(CALLBACK)(INT, WPARAM, LPARAM)）
+_MACRO_WH_MOUSE_LL = 14
+_MACRO_WH_KEYBOARD_LL = 13
+_MACRO_WM_MOUSEMOVE = 0x0200
+_MACRO_WM_LBUTTONDOWN = 0x0201
+_MACRO_WM_RBUTTONDOWN = 0x0204
+_MACRO_WM_MBUTTONDOWN = 0x0207
+_MACRO_WM_MOUSEWHEEL = 0x020A
+_MACRO_WM_KEYDOWN = 0x0100
+_MACRO_WM_KEYUP = 0x0101
+_MACRO_WM_SYSKEYDOWN = 0x0104
+_MACRO_WM_SYSKEYUP = 0x0105
+_MACRO_LLMHF_INJECTED = 0x00000001
+_MACRO_LLKHF_INJECTED = 0x00000010
+_MACRO_PM_REMOVE = 1
+_MACRO_HOOKPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+
+class _MacroMSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MacroKBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+# 修饰键（录制侧仅维护按下状态，聚合进后续组合键，不产出独立事件）
+_MACRO_MOD_VKS = {0xA0: "shift", 0xA1: "shift", 0x10: "shift",
+                  0xA2: "ctrl", 0xA3: "ctrl", 0x11: "ctrl",
+                  0xA4: "alt", 0xA5: "alt", 0x12: "alt",
+                  0x5B: "win", 0x5C: "win"}
+_MACRO_MOD_ORDER = ("ctrl", "alt", "shift", "win")
+# 可回放按键名表（与 node 侧 press_key 的 VK 名表对齐；单字符键按字符取名）
+_MACRO_VK_NAMES = {0x08: "backspace", 0x09: "tab", 0x0D: "enter", 0x13: "pause",
+                   0x14: "capslock", 0x1B: "esc", 0x20: "space", 0x21: "pageup",
+                   0x22: "pagedown", 0x23: "end", 0x24: "home", 0x25: "left",
+                   0x26: "up", 0x27: "right", 0x28: "down", 0x2C: "printscreen",
+                   0x2D: "insert", 0x2E: "delete", 0x5D: "apps", 0x90: "numlock",
+                   0x91: "scrolllock", 0xAD: "volumemute", 0xAE: "volumedown",
+                   0xAF: "volumeup"}
+
+
+def _macro_check_int(value, low, high, what):
+    """宏数值字段校验：必须是整数（布尔不算）且落在 [low, high]。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("宏校验失败：%s 必须是整数（得到 %r）" % (what, value))
+    if value < low or value > high:
+        raise ValueError("宏校验失败：%s 超出允许范围 %d–%d（得到 %d）"
+                         % (what, low, high, value))
+
+
+def validate_macro(data):
+    """宏加载校验（B17/D30，纯函数、可独立调用/冒烟白盒）：严格校验、整体拒绝——
+    任何一项不合法即抛 ValueError（message 明确指明问题与位置），绝不部分接受。
+    通过则返回规范化宏 dict（补齐 button 默认值、剥离未知键），供分段与回放直接
+    使用。校验规则（README"宏（macro rec/run）"节如实登记）：顶层对象、version==1、
+    name 可选字符串、actions 数组（可为空）；动作类型白名单 click/doubleclick/move/
+    wheel/type/key + 独立延迟步 {"delay_ms": N}；未知动作类型/缺必填字段/类型不对/
+    数值越界/未知字段一律拒绝。D30：不支持循环/条件/变量/表达式/外部命令。"""
+    if not isinstance(data, dict):
+        raise ValueError("宏校验失败：顶层必须是 JSON 对象（得到 %s）"
+                         % type(data).__name__)
+    version = data.get("version")
+    if isinstance(version, bool) or version != MACRO_VERSION:
+        raise ValueError("宏校验失败：version 仅支持 %d（得到 %r）"
+                         % (MACRO_VERSION, version))
+    name = data.get("name", "")
+    if not isinstance(name, str) or len(name) > 128:
+        raise ValueError("宏校验失败：name 必须是不超过 128 字符的字符串"
+                         "（仅展示用，可省略）")
+    actions = data.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("宏校验失败：actions 必须是数组（可为空）")
+    if len(actions) > MACRO_ACTIONS_MAX:
+        raise ValueError("宏校验失败：动作条数 %d 超过上限 %d"
+                         % (len(actions), MACRO_ACTIONS_MAX))
+    spec = {
+        "click": ({"x", "y"}, {"button"}),
+        "doubleclick": ({"x", "y"}, {"button"}),
+        "move": ({"x", "y"}, set()),
+        "wheel": ({"delta"}, set()),
+        "type": ({"text"}, set()),
+        "key": ({"key"}, set()),
+    }
+    normalized = []
+    for index, action in enumerate(actions, start=1):
+        where = "第 %d 个动作" % index
+        if not isinstance(action, dict):
+            raise ValueError("宏校验失败：%s 必须是对象（得到 %s）"
+                             % (where, type(action).__name__))
+        keys = set(action)
+        if "type" not in action:
+            # 独立延迟步：仅允许 {"delay_ms": <毫秒>}
+            if "delay_ms" not in keys:
+                raise ValueError("宏校验失败：%s 缺少 type 字段（合法类型：%s；"
+                                 "或写独立延迟步 {\"delay_ms\": <毫秒>}）"
+                                 % (where, "/".join(MACRO_ACTION_TYPES)))
+            if keys - {"delay_ms"}:
+                raise ValueError("宏校验失败：%s（独立延迟步）包含未知字段：%s"
+                                 % (where, "、".join(sorted(keys - {"delay_ms"}))))
+            _macro_check_int(action["delay_ms"], 0, MACRO_DELAY_MAX_MS,
+                             where + " 的 delay_ms")
+            normalized.append({"delay_ms": action["delay_ms"]})
+            continue
+        kind = action["type"]
+        if kind not in MACRO_ACTION_TYPES:
+            raise ValueError("宏校验失败：%s 未知动作类型 %r（允许：%s；"
+                             "D30：宏不支持循环/条件/变量/表达式/外部命令，"
+                             "不允许任意脚本）"
+                             % (where, kind, "/".join(MACRO_ACTION_TYPES)))
+        required, optional = spec[kind]
+        missing = required - keys
+        if missing:
+            raise ValueError("宏校验失败：%s（%s）缺少必填字段：%s"
+                             % (where, kind, "、".join(sorted(missing))))
+        unknown = keys - required - optional - {"type", "delay_ms"}
+        if unknown:
+            raise ValueError("宏校验失败：%s（%s）包含未知字段：%s"
+                             % (where, kind, "、".join(sorted(unknown))))
+        out = {"type": kind}
+        if kind in ("click", "doubleclick", "move"):
+            _macro_check_int(action["x"], 0, MACRO_XY_MAX, where + " 的 x")
+            _macro_check_int(action["y"], 0, MACRO_XY_MAX, where + " 的 y")
+            out["x"], out["y"] = action["x"], action["y"]
+        if kind in ("click", "doubleclick"):
+            button = action.get("button", "left")
+            if button not in MACRO_BUTTONS:
+                raise ValueError("宏校验失败：%s 的 button 只能是 %s（得到 %r）"
+                                 % (where, "/".join(MACRO_BUTTONS), button))
+            out["button"] = button
+        if kind == "wheel":
+            _macro_check_int(action["delta"], -MACRO_WHEEL_MAX, MACRO_WHEEL_MAX,
+                             where + " 的 delta")
+            out["delta"] = action["delta"]
+        if kind == "type":
+            text = action["text"]
+            if not isinstance(text, str) or not 1 <= len(text) <= MACRO_TEXT_MAX:
+                raise ValueError("宏校验失败：%s 的 text 必须是 1–%d 字符的字符串"
+                                 % (where, MACRO_TEXT_MAX))
+            out["text"] = text
+        if kind == "key":
+            key = action["key"]
+            if not isinstance(key, str) or not 1 <= len(key) <= MACRO_KEY_MAX:
+                raise ValueError("宏校验失败：%s 的 key 必须是 1–%d 字符的非空字符串"
+                                 "（如 \"ctrl+a\"）" % (where, MACRO_KEY_MAX))
+            out["key"] = key
+        if "delay_ms" in keys:
+            _macro_check_int(action["delay_ms"], 0, MACRO_DELAY_MAX_MS,
+                             where + " 的 delay_ms")
+            out["delay_ms"] = action["delay_ms"]
+        normalized.append(out)
+    return {"version": MACRO_VERSION, "name": name, "actions": normalized}
+
+
+def load_macro(path):
+    """读取并严格校验宏文件（B17/D30；纯控制端本地解析，不涉网络）。
+    失败抛 ValueError（文件缺失/不可读/非合法 JSON/校验不通过，message 明确）。"""
+    macro_path = Path(path)
+    if not macro_path.is_file():
+        raise ValueError("宏文件不存在：%s" % macro_path)
+    try:
+        text = macro_path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise ValueError("宏文件无法读取：%s（%s）" % (macro_path, exc))
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ValueError("宏文件不是合法 JSON：%s（%s）" % (macro_path, exc))
+    return validate_macro(data)
+
+
+def macro_plan(actions, speed=1.0):
+    """宏动作序列 → 分段回放计划（B17，纯函数）：连续无延迟的动作合为一段一请求；
+    独立延迟步与动作内 delay_ms 在请求之间由控制端 sleep（实际等待 = delay_ms /
+    speed，speed 为 --speed 倍率）。返回 [{"wait": <该段发送前等待秒数 float>,
+    "actions": [...]}]；末尾无后续动作的延迟不保留（回放收尾即释放租约，不空等）。
+    仅接受已通过 validate_macro 的规范化动作。"""
+    speed = float(speed)
+    if not speed > 0:
+        raise ValueError("宏回放失败：speed 必须为正数（得到 %r）" % speed)
+    steps = []
+    cur_wait_ms = 0                     # 当前段发送前的累计等待（毫秒）
+    cur_actions = []
+    for action in actions:
+        wait = action.get("delay_ms", 0) or 0
+        if wait:
+            if cur_actions:
+                steps.append({"wait": cur_wait_ms / speed / 1000.0,
+                              "actions": cur_actions})
+                cur_wait_ms, cur_actions = 0, []
+            cur_wait_ms += wait
+        if "type" in action:
+            cur_actions.append(action)
+    if cur_actions:
+        steps.append({"wait": cur_wait_ms / speed / 1000.0, "actions": cur_actions})
+    return steps
+
+
+def macro_events_to_actions(events):
+    """录制事件流 → 宏动作序列（B17，纯函数、供冒烟白盒以合成事件直接调用）。
+    事件须按时间升序（录制钩子天然有序），格式：{"kind": "move|click|wheel|key|
+    text", "t": <unix 秒>, ...各 kind 字段}。映射规则（README 如实登记）：
+    - 移动去抖：位移 ≥ MACRO_REC_MOVE_MIN_PX 或距上次保留事件 ≥
+      MACRO_REC_MOVE_MAX_GAP_MS 才采样成 move（连续微移不会塞满宏）；
+    - 点击聚合：同键、间隔 ≤ MACRO_REC_DOUBLE_MS 且位移 ≤ MACRO_REC_DOUBLE_PX
+      的相邻两次点击合并为 doubleclick（取第一次点击坐标与其 delay）；
+    - 可打印字符聚合为 type（间隔 > MACRO_REC_TEXT_SPLIT_MS 拆分为新动作）；
+    - 其余按键（修饰键组合串）为 key；滚轮为 wheel（原始 delta，120/格）；
+    - 相邻保留事件的间隔写入 delay_ms（毫秒，0–MACRO_DELAY_MAX_MS，首个动作为 0）。"""
+    actions = []
+    last_t = None                       # 上一个保留事件的时间（delay 基准）
+    last_event_t = None                 # 上一个保留事件的时间（移动时间阈值基准）
+    last_pos = None                     # 上一个保留 move 的坐标（移动位移阈值基准）
+    pending_text = None                 # 打字聚合缓冲
+    pending_first_t = None
+    pending_last_t = None
+    last_click = None                   # (button, x, y, t, 动作下标)，供双击聚合
+
+    def emit(action, t_event, t_advance=None):
+        nonlocal last_t
+        if t_advance is None:
+            t_advance = t_event
+        delay = 0 if last_t is None else int(round((t_event - last_t) * 1000))
+        delay = max(0, min(MACRO_DELAY_MAX_MS, delay))
+        if delay:
+            action["delay_ms"] = delay
+        actions.append(action)
+        last_t = t_advance
+
+    def flush_text():
+        nonlocal pending_text, pending_first_t, pending_last_t
+        if pending_text:
+            emit({"type": "type", "text": pending_text},
+                 pending_first_t, pending_last_t)
+        pending_text, pending_first_t, pending_last_t = None, None, None
+
+    for ev in events:
+        kind = ev.get("kind")
+        t = float(ev.get("t") or 0.0)
+        if kind == "move":
+            x, y = int(ev.get("x", 0)), int(ev.get("y", 0))
+            keep = last_pos is None
+            if not keep:
+                dist = max(abs(x - last_pos[0]), abs(y - last_pos[1]))
+                gap = (t - last_event_t) * 1000.0 if last_event_t is not None else 0.0
+                keep = dist >= MACRO_REC_MOVE_MIN_PX \
+                    or gap >= MACRO_REC_MOVE_MAX_GAP_MS
+            if keep:
+                flush_text()
+                emit({"type": "move", "x": x, "y": y}, t)
+                last_pos = (x, y)
+                last_event_t = t
+        elif kind == "click":
+            x, y = int(ev.get("x", 0)), int(ev.get("y", 0))
+            button = ev.get("button", "left")
+            flush_text()
+            if last_click and last_click[0] == button \
+                    and (t - last_click[3]) * 1000 <= MACRO_REC_DOUBLE_MS \
+                    and max(abs(x - last_click[1]), abs(y - last_click[2])) \
+                    <= MACRO_REC_DOUBLE_PX:
+                # 合并为双击：替换上一次 click 动作（保留其 delay 与第一次坐标）
+                merged = dict(actions[last_click[4]])
+                merged.update({"type": "doubleclick", "x": last_click[1],
+                               "y": last_click[2], "button": button})
+                actions[last_click[4]] = merged
+                last_click = None
+                last_t = t              # 后续间隔从第二次按下起算
+            else:
+                emit({"type": "click", "x": x, "y": y, "button": button}, t)
+                last_click = (button, x, y, t, len(actions) - 1)
+            last_event_t = t
+        elif kind == "wheel":
+            flush_text()
+            emit({"type": "wheel", "delta": int(ev.get("delta", 0))}, t)
+            last_click = None
+            last_event_t = t
+        elif kind == "key":
+            flush_text()
+            emit({"type": "key", "key": str(ev.get("key", ""))}, t)
+            last_click = None
+            last_event_t = t
+        elif kind == "text":
+            ch = str(ev.get("text", ""))
+            if not ch:
+                continue
+            if pending_text is None:
+                pending_text, pending_first_t = ch, t
+            elif (t - pending_last_t) * 1000 > MACRO_REC_TEXT_SPLIT_MS:
+                flush_text()
+                pending_text, pending_first_t = ch, t
+            else:
+                pending_text += ch
+            pending_last_t = t
+            last_click = None
+            last_event_t = t
+        # 其他 kind（未知事件）忽略
+    flush_text()
+    return actions
+
+
+def macro_run_segments(device, plan, trust=False, progress=None,
+                       sleeper=time.sleep, sender=None):
+    """宏分段执行（B17/契约 §21.2 全程持租约 + FR-06 中断即释放；供冒烟白盒注入
+    sleeper/sender）：首段请求带 X-Input-Lease: acquire，其后各段无头（隐式
+    acquire = 本人持有即续期，契约 §21.2）；每段发送前先 sleep 该段等待秒数
+    （= delay_ms / speed）。任何异常（含 KeyboardInterrupt/SystemExit）→
+    best-effort 发 release（空 actions，空 actions 合法）后原样抛出；正常结束
+    同样发 release（避免占着租约等 60 秒过期）。目标机锁屏/非交互 → 中止并如实
+    报错（release 后抛 SystemExit）。返回成功执行的段数。
+    sender 缺省 xd.request；409 INPUT_LEASE_TAKEN 经既有错误路径抛 RuntimeError
+    （首段被占则整单不执行；中途被抢占则中止剩余动作）。"""
+    send_fn = sender or request
+    executed = 0
+    try:
+        for index, step in enumerate(plan):
+            if step["wait"] > 0:
+                sleeper(step["wait"])
+            headers = {"X-Input-Lease": "acquire"} if index == 0 else None
+            data = send_fn(device, "POST", "/v1/input", {"actions": step["actions"]},
+                           trust=trust, extra_headers=headers, timeout=30)
+            executed += 1
+            if isinstance(data, dict):
+                if data.get("locked"):
+                    raise SystemExit("目标机锁屏，输入未生效")
+                if data.get("interactive") is False:
+                    raise SystemExit("目标机不在交互式桌面会话，输入未生效")
+            if progress is not None:
+                progress(index, step, data)
+    except BaseException:
+        try:
+            send_fn(device, "POST", "/v1/input", {"actions": []},
+                    trust=trust, extra_headers={"X-Input-Lease": "release"},
+                    timeout=10)
+        except Exception:
+            pass                        # 释放尽力而为，不掩盖原异常
+        raise
+    try:
+        send_fn(device, "POST", "/v1/input", {"actions": []},
+                trust=trust, extra_headers={"X-Input-Lease": "release"}, timeout=10)
+    except Exception:
+        pass
+    return executed
+
+
+def _macro_vk_char(user32, vk, scan, mods):
+    """按键 → 可打印字符（ToUnicodeEx，手工构造 Shift/CapsLock 状态）；无字符
+    返回 None。仅录制线程在钩子回调内调用。"""
+    state = (ctypes.c_ubyte * 256)()
+    if "shift" in mods:
+        state[0x10] = 0x80
+    if user32.GetKeyState(0x14) & 1:
+        state[0x14] = 0x01
+    buf = ctypes.create_unicode_buffer(4)
+    hkl = user32.GetKeyboardLayout(0)
+    n = user32.ToUnicodeEx(vk, scan, state, buf, 4, 0, hkl)
+    if n > 0 and buf.value:
+        return buf.value[0]
+    return None
+
+
+def _macro_key_name(user32, vk, mods):
+    """按键 → node 侧 press_key 可回放的组合键串（修饰键序 ctrl/alt/shift/win）；
+    node 按键白名单（VK 名表 + 单字符）之外的按键返回 None（录制时跳过并计数）。"""
+    base = _MACRO_VK_NAMES.get(vk)
+    if base is None:
+        ch = _macro_vk_char(user32, vk, 0, set())
+        if ch and ord(ch) >= 0x20 and ord(ch) != 0x7F:
+            base = ch.lower()
+        else:
+            return None
+    return "+".join([m for m in _MACRO_MOD_ORDER if m in mods] + [base])
+
+
+def cmd_macro_rec(args, registry):
+    """宏录制（B17/D9/D30，纯本地命令：不触网络、不写被控端、不读注册表，
+    registry 参数仅保持子命令签名一致）：Windows 低级键鼠钩子（WH_MOUSE_LL/
+    WH_KEYBOARD_LL，纯标准库 ctypes）捕获控制端本机操作 --seconds 秒（默认 10，
+    Ctrl+C 提前结束）。移动去抖、双击/打字聚合、相邻事件间隔写 delay_ms；产物经
+    与回放同一套严格校验（validate_macro）后原子写盘（写前校验，失败不写盘）。
+    钩子安装失败明确报错不静默；所有退出路径必调 UnhookWindowsHookEx；忽略注入
+    事件（防"回放本机时录制自录"回环）。录制不自动回放。"""
+    out = Path(args.out)
+    seconds = int(args.seconds)
+    if not 1 <= seconds <= 3600:
+        raise SystemExit("--seconds 取值 1–3600（得到 %d）" % seconds)
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p,
+                                    wintypes.UINT, wintypes.UINT, wintypes.UINT]
+    user32.PeekMessageW.restype = wintypes.BOOL
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.SetWindowsHookExW.argtypes = [ctypes.c_int, _MACRO_HOOKPROC,
+                                         ctypes.c_void_p, wintypes.DWORD]
+    user32.SetWindowsHookExW.restype = ctypes.c_void_p
+    user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+    user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+    user32.CallNextHookEx.restype = ctypes.c_ssize_t
+    user32.ToUnicodeEx.argtypes = [wintypes.UINT, wintypes.UINT,
+                                   ctypes.POINTER(ctypes.c_ubyte),
+                                   ctypes.POINTER(ctypes.c_wchar),
+                                   ctypes.c_int, wintypes.UINT, ctypes.c_void_p]
+    user32.ToUnicodeEx.restype = ctypes.c_int
+    user32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+    user32.GetKeyboardLayout.restype = ctypes.c_void_p
+    user32.GetKeyState.argtypes = [ctypes.c_int]
+    user32.GetKeyState.restype = ctypes.c_short
+
+    # DPI 感知（per-monitor v2，失败回退系统级）：让钩子坐标与物理像素一致
+    # （node 侧按虚拟桌面物理像素归一化，契约 §6.7）
+    try:
+        user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        if not user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            user32.SetProcessDPIAware()
+    except AttributeError:
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    events = []
+    counters = {"mouse": 0, "key": 0, "skipped": 0}
+    held = set()                        # 当前按下的修饰键
+    move_state = {"pos": None, "t": 0.0}
+
+    def on_mouse(n_code, w_param, l_param):
+        if n_code >= 0:
+            info = ctypes.cast(l_param,
+                               ctypes.POINTER(_MacroMSLLHOOKSTRUCT)).contents
+            if not int(info.flags) & _MACRO_LLMHF_INJECTED:
+                msg = int(w_param)
+                t = time.time()
+                if msg == _MACRO_WM_MOUSEMOVE:
+                    x, y = int(info.pt.x), int(info.pt.y)
+                    keep = move_state["pos"] is None
+                    if not keep:
+                        dist = max(abs(x - move_state["pos"][0]),
+                                   abs(y - move_state["pos"][1]))
+                        gap = (t - move_state["t"]) * 1000.0
+                        keep = dist >= MACRO_REC_MOVE_MIN_PX \
+                            or gap >= MACRO_REC_MOVE_MAX_GAP_MS
+                    if keep:
+                        events.append({"kind": "move", "x": x, "y": y, "t": t})
+                        move_state["pos"], move_state["t"] = (x, y), t
+                        counters["mouse"] += 1
+                elif msg in (_MACRO_WM_LBUTTONDOWN, _MACRO_WM_RBUTTONDOWN,
+                             _MACRO_WM_MBUTTONDOWN):
+                    button = {0x0201: "left", 0x0204: "right",
+                              0x0207: "middle"}[msg]
+                    events.append({"kind": "click", "x": int(info.pt.x),
+                                   "y": int(info.pt.y), "button": button, "t": t})
+                    counters["mouse"] += 1
+                elif msg == _MACRO_WM_MOUSEWHEEL:
+                    delta = ctypes.c_short(
+                        (int(info.mouseData) >> 16) & 0xFFFF).value
+                    events.append({"kind": "wheel", "delta": int(delta), "t": t})
+                    counters["mouse"] += 1
+        return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+    def on_key(n_code, w_param, l_param):
+        if n_code >= 0:
+            info = ctypes.cast(l_param,
+                               ctypes.POINTER(_MacroKBDLLHOOKSTRUCT)).contents
+            if not int(info.flags) & _MACRO_LLKHF_INJECTED:
+                vk = int(info.vkCode)
+                msg = int(w_param)
+                if msg in (_MACRO_WM_KEYDOWN, _MACRO_WM_SYSKEYDOWN):
+                    if vk in _MACRO_MOD_VKS:
+                        held.add(_MACRO_MOD_VKS[vk])
+                    else:
+                        counters["key"] += 1
+                        t = time.time()
+                        mods = {m for m in _MACRO_MOD_ORDER if m in held}
+                        ev = None
+                        if {"ctrl", "alt", "win"} & mods:
+                            name = _macro_key_name(user32, vk, mods)
+                            if name:
+                                ev = {"kind": "key", "key": name, "t": t}
+                        else:
+                            ch = _macro_vk_char(user32, vk,
+                                                int(info.scanCode), mods)
+                            if ch and ord(ch) >= 0x20 and ord(ch) != 0x7F:
+                                ev = {"kind": "text", "text": ch, "t": t}
+                            else:
+                                name = _macro_key_name(user32, vk, mods)
+                                if name:
+                                    ev = {"kind": "key", "key": name, "t": t}
+                        if ev is None:
+                            counters["skipped"] += 1
+                        else:
+                            events.append(ev)
+                elif msg in (_MACRO_WM_KEYUP, _MACRO_WM_SYSKEYUP):
+                    if vk in _MACRO_MOD_VKS:
+                        held.discard(_MACRO_MOD_VKS[vk])
+        return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+    mouse_proc = _MACRO_HOOKPROC(on_mouse)
+    key_proc = _MACRO_HOOKPROC(on_key)
+    mouse_hook = user32.SetWindowsHookExW(_MACRO_WH_MOUSE_LL, mouse_proc, None, 0)
+    key_hook = None
+    try:
+        if not mouse_hook:
+            raise SystemExit("低级鼠标钩子安装失败（Windows 错误码 %d）："
+                             "可能被安全软件拦截或当前会话不允许全局钩子，录制未开始"
+                             % ctypes.get_last_error())
+        key_hook = user32.SetWindowsHookExW(_MACRO_WH_KEYBOARD_LL, key_proc, None, 0)
+        if not key_hook:
+            raise SystemExit("低级键盘钩子安装失败（Windows 错误码 %d）："
+                             "可能被安全软件拦截或当前会话不允许全局钩子，录制未开始"
+                             % ctypes.get_last_error())
+        print("正在录制 %d 秒，Ctrl+C 结束；控制端本机键鼠操作将捕获到：%s"
+              % (seconds, out))
+        msg = wintypes.MSG()
+        deadline = time.time() + seconds
+        next_hint = time.time() + 2.0
+        try:
+            while time.time() < deadline:
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0,
+                                          _MACRO_PM_REMOVE):
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                if time.time() >= next_hint:
+                    print("  已捕获 %d 个事件（鼠标 %d / 键盘 %d）"
+                          % (counters["mouse"] + counters["key"],
+                             counters["mouse"], counters["key"]))
+                    next_hint = time.time() + 2.0
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            pass                        # Ctrl+C 提前结束（正常产物路径）
+    finally:
+        if key_hook:
+            user32.UnhookWindowsHookEx(key_hook)
+        if mouse_hook:
+            user32.UnhookWindowsHookEx(mouse_hook)
+
+    actions = macro_events_to_actions(events)
+    try:
+        data = validate_macro({"version": MACRO_VERSION, "name": out.stem,
+                               "actions": actions})
+    except ValueError as exc:
+        raise SystemExit("录制产物未通过加载校验（内部错误，未写盘）：%s" % exc)
+    try:
+        _atomic_write_text(out, json.dumps(data, ensure_ascii=False, indent=2))
+    except OSError as exc:
+        raise SystemExit("无法写入宏文件 %s（%s）" % (out, exc))
+    if not data["actions"]:
+        print("未捕获任何事件，已写入空宏（actions 为空）-> %s" % out)
+        return
+    skipped_text = ("，跳过 %d 个不可回放按键（如 F 功能键/输入法组字键，"
+                    "被控端按键白名单不含它们）" % counters["skipped"]) \
+        if counters["skipped"] else ""
+    print("已录制 %d 个动作 -> %s（捕获鼠标 %d / 键盘 %d 个事件，已通过加载校验%s）"
+          % (len(data["actions"]), out, counters["mouse"], counters["key"],
+             skipped_text))
+
+
+def cmd_macro_run(args, registry):
+    """宏回放（B17/D9/D30）：加载校验失败即整体拒绝（不执行任何动作、不发任何
+    请求）→ 按 delay 分段经既有 /v1/input 发送（连续无延迟动作合为一段一请求，
+    段间控制端 sleep delay_ms/speed）→ 全程持输入租约（首段 X-Input-Lease:
+    acquire、其后无头=隐式续期，契约 §21.2）→ 正常结束发 release（空 actions）；
+    Ctrl+C 或异常中断即 best-effort release（FR-06"中断即释放"）。他人持有 →
+    409 INPUT_LEASE_TAKEN 如实报错（首段被占则整单不执行；中途被抢占则中止剩余
+    动作）。--speed 正浮点 0.01–100 等比缩放 delay_ms。"""
+    speed = float(args.speed)
+    if not MACRO_SPEED_MIN <= speed <= MACRO_SPEED_MAX:
+        raise SystemExit("--speed 越界（允许 %.2f–%g）：%g"
+                         % (MACRO_SPEED_MIN, MACRO_SPEED_MAX, speed))
+    try:
+        macro = load_macro(args.file)
+    except ValueError as exc:
+        raise SystemExit(str(exc))      # 整体拒绝（D30）：未发任何请求
+    plan = macro_plan(macro["actions"], speed)
+    total_actions = sum(len(step["actions"]) for step in plan)
+    as_json = bool(getattr(args, "json", False))
+    if not plan:
+        if as_json:
+            dump({"macro": macro.get("name") or "", "actions": 0, "segments": 0,
+                  "executed": 0, "speed": speed, "released": False,
+                  "note": "宏无动作，未发送任何请求"})
+            return
+        print("宏无动作（actions 为空或仅末尾延迟），未发送任何请求")
+        return
+    device = resolve(registry, args.name, trust=_trust(args))
+    if as_json:
+        progress = None
+    else:
+        def progress(index, step, _data):
+            wait_text = ("等待 %.2fs 后" % step["wait"]) if step["wait"] > 0 else "立即"
+            print("  第 %d/%d 段（%s）：已发送 %d 个动作"
+                  % (index + 1, len(plan), wait_text, len(step["actions"])))
+    print("已加载宏「%s」：%d 个动作，分 %d 段发送（speed=%g）"
+          % (macro.get("name") or "(未命名)", total_actions, len(plan), speed))
+    try:
+        executed = macro_run_segments(device, plan, trust=_trust(args),
+                                      progress=progress)
+    except KeyboardInterrupt:
+        print("回放已中断（Ctrl+C）：输入租约已释放")
+        raise SystemExit(130)
+    if as_json:
+        dump({"macro": macro.get("name") or "", "actions": total_actions,
+              "segments": len(plan), "executed": executed, "speed": speed,
+              "released": True})
+        return
+    print("回放完成：共 %d 个动作 / %d 段，已释放输入租约" % (total_actions, len(plan)))
+
+
+# --------------------------------------------------------------------------
 # 入口
 # --------------------------------------------------------------------------
 
@@ -1891,6 +2547,28 @@ def build_parser():
     cp.add_argument("--host", default=None,
                     help="证书 CN（缺省用 %%COMPUTERNAME%%，由 gen_cert.ps1 处理）")
     cp.set_defaults(func=cmd_cert)
+
+    # M6 新增（B17 宏录制与回放，契约 §11 V1.7）：macro 双子解析器注册模式同
+    # task/cert。run 为设备类命令：挂 common 父解析器（--json）+ --trust；
+    # rec 为纯本地命令：不挂 common（无 --json/--trust，不涉设备与网络，参照 cert）。
+    p = sub.add_parser("macro",
+                       help="宏录制与回放（B17，纯控制端本地功能，D30 白名单动作序列）")
+    macro_sub = p.add_subparsers(dest="macro_action", required=True)
+    mp = macro_sub.add_parser(
+        "rec", help="录制控制端本机键鼠操作为宏文件（Windows 低级钩子，纯本地，不触网络）")
+    mp.add_argument("out", help="输出宏文件路径（JSON，UTF-8；格式见 README\"宏（macro rec/run）\"节）")
+    mp.add_argument("--seconds", type=int, default=10,
+                    help="录制时长秒数（默认 10，Ctrl+C 可提前结束；1–3600）")
+    mp.set_defaults(func=cmd_macro_rec)
+    mp = macro_sub.add_parser(
+        "run", parents=[common],
+        help="回放宏文件（分段经 /v1/input 发送，全程持输入租约，中断即释放）")
+    mp.add_argument("name")
+    mp.add_argument("file", help="宏文件路径（JSON，UTF-8）")
+    mp.add_argument("--speed", type=float, default=1.0,
+                    help="回放倍率（0.01–100，默认 1.0；等比缩放宏内 delay_ms）")
+    mp.add_argument("--trust", action="store_true", help=TRUST_HELP)
+    mp.set_defaults(func=cmd_macro_run)
 
     return parser
 

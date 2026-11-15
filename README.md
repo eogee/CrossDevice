@@ -161,6 +161,55 @@ py xd.py release nb
 
 坐标按虚拟桌面物理像素归一化；`wheel` 的滚动量负值向上。同一被控端同一时刻只有一个控制端持有输入权（60 秒租约自动续期）：他人持有时输入命令返回 `INPUT_LEASE_TAKEN`；需要抢占时显式加 `--take`（如 `py xd.py click --take nb 960 540`），被抢占方下一次输入请求会收到一次 `INPUT_LEASE_TAKEN` 提示；`release` 主动释放租约。被控端处于锁屏或非交互会话时，输入不会生效并明确提示（见"常见问题"）。
 
+### 宏（macro rec/run）
+
+把本机（控制端）录下的一段键鼠操作存成宏文件，再按原节奏回放到任意已注册设备。宏是**白名单动作类型序列**——**不允许任意脚本**（D30 红线：不支持循环、条件、变量、表达式、外部命令）；宏文件只在控制端本地解析与严格校验，不进入被控端执行面，加载校验失败即整体拒绝、不执行任何动作。
+
+**录制（纯本地命令：不触网络、不写被控端）**：
+
+```
+py xd.py macro rec demo.json               # 录 10 秒（Ctrl+C 提前结束）
+py xd.py macro rec demo.json --seconds 20
+```
+
+录制期间控制台提示「正在录制 …，Ctrl+C 结束」并每 2 秒显示事件计数；结束时输出宏文件路径与动作数。录制经 Windows 低级键鼠钩子（WH_MOUSE_LL/WH_KEYBOARD_LL，纯标准库 ctypes）捕获**控制端本机**键鼠；忽略注入事件（回放不会被自录进去）；钩子安装失败（被安全软件拦截等）会明确报错。录制完成后**不自动回放**。
+
+**回放（经既有 /v1/input 分段发送，全程持输入租约）**：
+
+```
+py xd.py macro run nb demo.json
+py xd.py macro run nb demo.json --speed 2   # 2 倍速：所有 delay_ms 等比减半
+```
+
+回放按宏内延迟**分段**发送（连续无延迟的动作合成一段一请求，段间由控制端等待）。全程持输入租约：首段请求带头 `X-Input-Lease: acquire`、其后各段无头（隐式续期，契约 §21.2）；他人持有时返回 `INPUT_LEASE_TAKEN` 且不执行（首段被占则整单不执行；中途被抢占则中止剩余动作并如实报错）。**Ctrl+C 或异常中断会立即 best-effort 释放输入租约**（FR-06"中断即释放"）；正常回放结束也会自动释放（不等 60 秒过期）。支持 `--json`（输出摘要 JSON）与 `--trust`（TOFU 指纹变更确认）。
+
+**宏文件格式（JSON，UTF-8）示例**：
+
+```json
+{
+  "version": 1,
+  "name": "示例宏",
+  "actions": [
+    {"type": "move", "x": 960, "y": 540},
+    {"delay_ms": 500},
+    {"type": "click", "x": 200, "y": 300, "button": "left"},
+    {"type": "doubleclick", "x": 200, "y": 300},
+    {"type": "wheel", "delta": -360},
+    {"type": "type", "text": "hello 你好"},
+    {"type": "key", "key": "ctrl+s", "delay_ms": 200}
+  ]
+}
+```
+
+- `version` 必须 == 1；`actions` 为数组（可为空）；`name` 可选、仅展示用。
+- 动作与 `/v1/input` 的 actions 同构：`click`/`doubleclick`（x/y/button，button ∈ left/right/middle，默认 left）、`move`（x/y）、`wheel`（delta，可负，120 为一格）、`type`（text）、`key`（key，如 `ctrl+a`）；另有独立延迟步 `{"delay_ms": <毫秒>}`，动作内也可带可选 `delay_ms`（该动作执行前等待）。
+- **严格校验（加载即报错、整体拒绝）**：未知动作类型、缺必填字段、类型不对、数值越界、未知字段均明确报错。数值边界：x/y 为非负整数且 ≤ 100000（宽松护栏防误填，非桌面物理边界）；delay_ms 取 0–600000（10 分钟）；wheel delta 为整数且绝对值 ≤ 100000；type 的 text 为 1–10000 字符；key 为 1–64 字符非空字符串；动作条数 ≤ 10000。
+- `--speed` 为正浮点 0.01–100（默认 1.0），等比缩放所有 delay_ms。
+
+**录制去抖与聚合阈值**：鼠标移动按「位移 ≥ 8 像素或距上次保留事件 ≥ 300 毫秒」采样（连续微移不会塞满宏）；同一键 500 毫秒内、位移 ≤ 8 像素的两次点击合并为 `doubleclick`（取第一次点击坐标）；连续可打印字符合并为 `type`（间隔 > 1.5 秒拆分）；修饰键组合（ctrl/alt/shift/win）聚合为 `key` 动作（如 `ctrl+c`）；相邻保留事件的间隔写入 `delay_ms`。被控端按键白名单不含的按键（F 功能键、媒体键、输入法组字键等）**不会被录制**，结束时如实提示跳过数量；中文等经输入法组字的文本建议用 `xd type` 补足。
+
+**人工核对提示（真钩子路径）**：自动冒烟（smoke_s6）只白盒验证事件映射，真实录制请人工核对一次——在空闲桌面运行 `py xd.py macro rec manual.json --seconds 8`，期间缓慢移动鼠标、单击/双击、滚动滚轮、输入几个字符并按一次 `ctrl+s`；打开 manual.json 核对去抖/聚合/delay 后，用 `py xd.py macro run <测试设备> manual.json` 回放比对动作顺序与节奏。注意录制会捕获本机所有键鼠输入（含终端窗口的键盘输入）。
+
 ### 文件传输与受限操作（`ls` / `cat` / `put` / `get` / `del` / `mkdir` / `mv`）
 
 ```
@@ -291,7 +340,7 @@ py node\node.py --instance beta --port 51901
 
 - [docs/需求文档.md](./docs/需求文档.md)：需求与验收标准（11.2 指标汇总表）。
 - [docs/接口契约.md](./docs/接口契约.md)：控制端与被控端唯一耦合面（协议规格、错误码、schema）。
-- [docs/测试要求.md](./docs/测试要求.md)：三层测试体系与回归门槛（`py tests/smoke_s1.py` 8/8、`smoke_s2.py` 10/10、`smoke_s3.py` 10/10）。
+- [docs/测试要求.md](./docs/测试要求.md)：三层测试体系与回归门槛（冒烟层六脚本：s1 8/8、s2 10/10、s3 10/10、s4 14/14、s5 5/5、s6 5/5）。
 - [docs/验收记录.md](./docs/验收记录.md)：11.2 逐行验收记录（签署依据）。
 - [docs/发布流程.md](./docs/发布流程.md)：tag 对齐 NODE_VERSION、打包清单与发布前门槛（`py tools/release_check.py --tag v0.4.0`）。
 - [SECURITY.md](./SECURITY.md)：安全问题报告渠道与已知边界。
