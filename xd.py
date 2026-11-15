@@ -1448,8 +1448,9 @@ def cmd_elevate(args, registry):
     # B32 一期轻量形态（D40 / 契约 V1.4 变更记录）：安装成功后补一行白名单首次配置指引。
     # 文案为最终输出原文（README"首次配置"小节同款，勿偏离）；本行不用 % 格式化，
     # %LOCALAPPDATA% 按字面输出；仅新增文案不改既有语义（E-02）。
+    # M5 攒批（V1.6 同步）：默认空口径由"拒绝一切"修正为"仅暂存目录可写"（B42/V1.6 §14.1）。
     print("白名单首次配置：编辑被控端 node.json（默认 %LOCALAPPDATA%\\CrossDevice\\node.json）"
-          "的 \"workspace\" 键（字符串数组，默认空=拒绝一切写入/删除），"
+          "的 \"workspace\" 键（字符串数组，默认空=仅默认暂存目录可写），"
           "如 \"workspace\": [\"D:\\\\Shared\"]；或启动 node 时加 --workspace \"D:\\\\Shared\"。")
 
 

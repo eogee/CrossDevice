@@ -174,7 +174,7 @@ py xd.py del nb D:\Shared\old.log --yes
 ```
 
 - **读取不限路径**（`ls`/`cat`/`get` 不受白名单约束）；`cat` 遇二进制文件会拒绝并提示改用 `get`；`put` 的目标路径受白名单约束（见下一条）。
-- **写入/删除/建目录/移动/上传仅在白名单根内允许**（越界返回 `SANDBOX_DENIED`），白名单配置见"首次配置"。
+- **写入/删除/建目录/移动/上传仅在白名单根内允许**（越界返回 `SANDBOX_DENIED`）；白名单默认空 = 仅**默认暂存目录**可写（`<config 目录>/tmp`，node 启动自动创建、恒可用，不计入 16 根上限）——自动化脚本/临时产物推荐先 `put` 到暂存目录再 `exec` 执行该文件（规避 cmd 单条 8191 字符上限与引号转义，见[契约 §14.1](./docs/接口契约.md)）；扩大范围见"首次配置"。
 - `put`/`get` 为流式分块传输（4MB 分块），无文件大小上限，**断点续传**：上传中断后重跑同一命令自动续传（`--fresh` 丢弃断点重来）；下载断点保存在 `<本地文件>.crosspart`，下载完成后按 MD5 校验。
 - 文件删除定名 `del`（`rm` 保留为"移除设备"语义）。
 
@@ -241,7 +241,8 @@ py node\node.py --instance beta --port 51901
 
 写/删/建目录/移动/上传受**工作空间白名单**约束：
 
-- 白名单默认**空 = 拒绝一切写/删/建目录/移动/上传**（读取不受限）。
+- 白名单默认**空 = 仅默认暂存目录可写**（`<config 目录>/tmp`，`--instance` 时 `tmp-<名>`；node 启动自动创建、恒可用、不计 16 根上限），其余写/删/建目录/移动/上传全拒（读取不受限）。
+- **当前允许根可查询**：`xd info <设备> --json` 的 `workspace_roots` / `workspace_staging` 字段（node v0.5.1+）；a4agent 集成下另有 `GET /api/v1/devices/{name}/workspaces` 查询端点（只读）。
 - 白名单是**被控端本地配置**，控制端无法远程扩大它；每台设备需要一次本地授权（安装器或 `xd elevate` 引导，D40）。
 - 配置方式二选一（与 `xd elevate` 安装成功输出的指引行同口径）：
   1. 编辑被控端 `%LOCALAPPDATA%\CrossDevice\node.json`，加 `"workspace"` 键（字符串数组，绝对路径，最多 16 个根）——JSON 文件中路径用双反斜杠转义：
@@ -254,7 +255,7 @@ py node\node.py --instance beta --port 51901
      ```
 - `xd elevate` 安装成功时会在被控端输出如下指引行（与本节同口径）：
 
-  > 白名单首次配置：编辑被控端 node.json（默认 %LOCALAPPDATA%\CrossDevice\node.json）的 "workspace" 键（字符串数组，默认空=拒绝一切写入/删除），如 "workspace": ["D:\\Shared"]；或启动 node 时加 --workspace "D:\\Shared"。
+  > 白名单首次配置：编辑被控端 node.json（默认 %LOCALAPPDATA%\CrossDevice\node.json）的 "workspace" 键（字符串数组，默认空=仅默认暂存目录可写），如 "workspace": ["D:\\Shared"]；或启动 node 时加 --workspace "D:\\Shared"。
 - 语义说明：白名单防的是**误操作**（越界写删被拒、删除需显式确认），不构成安全边界——`exec` 可执行任意命令从而绕过白名单（见"安全须知" R8/D7）。白名单根目录不存在时请求报错，node 不会自动创建根。
 
 ## 安全须知（务必阅读）
