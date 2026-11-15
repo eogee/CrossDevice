@@ -342,7 +342,7 @@ py node\node.py --instance beta --port 51901
 - [docs/接口契约.md](./docs/接口契约.md)：控制端与被控端唯一耦合面（协议规格、错误码、schema）。
 - [docs/测试要求.md](./docs/测试要求.md)：三层测试体系与回归门槛（冒烟层六脚本：s1 8/8、s2 10/10、s3 10/10、s4 14/14、s5 5/5、s6 5/5）。
 - [docs/验收记录.md](./docs/验收记录.md)：11.2 逐行验收记录（签署依据）。
-- [docs/发布流程.md](./docs/发布流程.md)：tag 对齐 NODE_VERSION、打包清单与发布前门槛（`py tools/release_check.py --tag v0.4.0`）。
+- [docs/发布流程.md](./docs/发布流程.md)：tag 对齐 NODE_VERSION、打包清单与发布前门槛（`py tools/release_check.py --tag v0.5.1`）。
 - [SECURITY.md](./SECURITY.md)：安全问题报告渠道与已知边界。
 
 ## 许可证
